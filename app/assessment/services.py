@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 
 import logfire
@@ -6,19 +7,30 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 
 from app.assessment.schemas import (
+    PASS_THRESHOLD,
     AssessmentRequest,
     AssessmentResult,
-    CriterionScore,
+    CriterionResult,
+    OverallResult,
     Scorecard,
 )
 from app.core.ai_provider import get_ai_model
 
 
-class AIScoreOutput(BaseModel):
-    """Structured output the AI agent must produce for each criterion."""
+class AICriterionOutput(BaseModel):
+    """What the AI must produce for each criterion."""
 
-    scores: list[CriterionScore]
-    overall_feedback: str
+    criterion_id: str
+    score: float = Field(ge=0)
+    comment: str
+    suggestions: str | None = None
+
+
+class AIScoreOutput(BaseModel):
+    """Structured output the AI agent must produce."""
+
+    criteria: list[AICriterionOutput]
+    summary: str
 
 
 @dataclass
@@ -30,7 +42,7 @@ class AssessmentDeps:
 def _build_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
     agent = Agent(
         get_ai_model(),
-        result_type=AIScoreOutput,
+        output_type=AIScoreOutput,
         deps_type=AssessmentDeps,
         retries=3,
         system_prompt=(
@@ -40,7 +52,8 @@ def _build_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
             "1. Read the criterion name and description carefully\n"
             "2. Evaluate the provided content against that criterion\n"
             "3. Assign a score from 0 to the criterion's max_score\n"
-            "4. Provide specific, actionable feedback citing evidence from the content\n\n"
+            "4. Provide a specific comment citing evidence from the content\n"
+            "5. Provide actionable suggestions if the score is not perfect, otherwise set suggestions to null\n\n"
             "Be fair, precise, and cite specific examples from the content."
         ),
     )
@@ -64,13 +77,13 @@ def _build_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
 
         return prompt
 
-    @agent.result_validator
+    @agent.output_validator
     async def validate_scores(
         ctx: RunContext[AssessmentDeps], result: AIScoreOutput
     ) -> AIScoreOutput:
         scorecard = ctx.deps.scorecard
         criterion_ids = {c.id for c in scorecard.criteria}
-        result_ids = {s.criterion_id for s in result.scores}
+        result_ids = {s.criterion_id for s in result.criteria}
 
         if result_ids != criterion_ids:
             missing = criterion_ids - result_ids
@@ -85,11 +98,11 @@ def _build_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
             )
 
         criteria_map = {c.id: c for c in scorecard.criteria}
-        for score in result.scores:
+        for score in result.criteria:
             criterion = criteria_map[score.criterion_id]
             if score.score > criterion.max_score:
                 raise ValueError(
-                    f"Score {score.score} for '{score.criterion_name}' exceeds "
+                    f"Score {score.score} for '{criterion.name}' exceeds "
                     f"max_score {criterion.max_score}. Please correct."
                 )
 
@@ -104,7 +117,7 @@ def get_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
 
 
 def calculate_weighted_score(
-    scores: list[CriterionScore], scorecard: Scorecard
+    ai_criteria: list[AICriterionOutput], scorecard: Scorecard
 ) -> float:
     criteria_map = {c.id: c for c in scorecard.criteria}
     total_weight = sum(c.weight for c in scorecard.criteria)
@@ -114,10 +127,10 @@ def calculate_weighted_score(
 
     weighted_sum = sum(
         (s.score / criteria_map[s.criterion_id].max_score) * criteria_map[s.criterion_id].weight
-        for s in scores
+        for s in ai_criteria
     )
 
-    return round(weighted_sum / total_weight * 100, 2)
+    return round(weighted_sum / total_weight * 100, 1)
 
 
 async def run_assessment(
@@ -139,15 +152,31 @@ async def run_assessment(
             model=get_ai_model(),
         )
 
-        ai_output = result.data
-        total_score = calculate_weighted_score(ai_output.scores, request.scorecard)
+        ai_output = result.output
+        overall_score = calculate_weighted_score(ai_output.criteria, request.scorecard)
+
+        criteria_map = {c.id: c for c in request.scorecard.criteria}
+        criteria_results = [
+            CriterionResult(
+                criterion_id=ai_c.criterion_id,
+                score=ai_c.score,
+                max_score=criteria_map[ai_c.criterion_id].max_score,
+                passed=ai_c.score >= criteria_map[ai_c.criterion_id].max_score * PASS_THRESHOLD,
+                comment=ai_c.comment,
+                suggestions=ai_c.suggestions,
+            )
+            for ai_c in ai_output.criteria
+        ]
 
         return AssessmentResult(
             scorecard_id=request.scorecard.id,
-            scorecard_name=request.scorecard.name,
-            subject=request.subject,
-            scores=ai_output.scores,
-            total_score=total_score,
-            overall_feedback=ai_output.overall_feedback,
-            knowledge_base_used=knowledge_base_context is not None,
+            scorecard_version=request.scorecard.version,
+            content_type=request.content_type,
+            assessed_at=datetime.now(timezone.utc),
+            overall=OverallResult(
+                score=overall_score,
+                max_score=100,
+                summary=ai_output.summary,
+            ),
+            criteria=criteria_results,
         )
