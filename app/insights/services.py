@@ -11,7 +11,7 @@ from app.insights.schemas import InsightReport
 def _build_insights_agent() -> Agent[None, InsightReport]:
     agent = Agent(
         get_ai_model(),
-        result_type=InsightReport,
+        output_type=InsightReport,
         retries=3,
         system_prompt=(
             "You are an expert QA analytics specialist. You analyze sets of assessment "
@@ -42,14 +42,16 @@ def _format_assessments_for_prompt(assessments: list[AssessmentResult]) -> str:
     parts = []
     for i, a in enumerate(assessments, 1):
         scores_text = "\n".join(
-            f"    - {s.criterion_name}: {s.score}/{s.max_score} — {s.feedback}"
-            for s in a.scores
+            f"    - {c.criterion_id}: {c.score}/{c.max_score} "
+            f"({'PASS' if c.passed else 'FAIL'}) — {c.comment}"
+            for c in a.criteria
         )
         parts.append(
-            f"Assessment {i}: {a.subject} (Scorecard: {a.scorecard_name})\n"
-            f"  Overall Score: {a.total_score}/100\n"
-            f"  Scores:\n{scores_text}\n"
-            f"  Overall Feedback: {a.overall_feedback}"
+            f"Assessment {i}: Scorecard {a.scorecard_id} (v{a.scorecard_version})\n"
+            f"  Type: {a.content_type.value}\n"
+            f"  Overall Score: {a.overall.score}/100\n"
+            f"  Summary: {a.overall.summary}\n"
+            f"  Criteria:\n{scores_text}"
         )
     return "\n\n".join(parts)
 
@@ -64,4 +66,4 @@ async def generate_insights(assessments: list[AssessmentResult]) -> InsightRepor
 
         agent = get_insights_agent()
         result = await agent.run(prompt, model=get_ai_model())
-        return result.data
+        return result.output

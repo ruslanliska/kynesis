@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: list[str] = ["http://localhost:5173"]
 
     # AI Provider
-    AI_MODEL: str = "openai:gpt-4o"
     OPENAI_API_KEY: str = ""
 
     # Pinecone

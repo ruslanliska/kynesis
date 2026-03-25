@@ -25,7 +25,6 @@ def _test_settings() -> Settings:
         SUPABASE_JWT_SECRET=TEST_JWT_SECRET,
         DATABASE_URL="postgresql+asyncpg://test:test@localhost:5432/test",
         ALLOWED_ORIGINS=["http://localhost:5173"],
-        AI_MODEL="openai:gpt-4o",
         OPENAI_API_KEY="test-openai-key",
         PINECONE_API_KEY="test-pinecone-key",
         PINECONE_INDEX_NAME="test-index",
