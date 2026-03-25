@@ -1,5 +1,21 @@
+import logging
+import os
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+
+# ── LangSmith env vars MUST be set before any langsmith import ──────────
+# langsmith.utils.get_env_var is @lru_cache — if tracing_is_enabled()
+# is called before these are set, the "false" result is cached forever.
+from app.core.config import get_settings as _get_settings
+
+_ls = _get_settings().langsmith
+if _ls.tracing and _ls.api_key:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = _ls.api_key
+    os.environ["LANGCHAIN_PROJECT"] = _ls.project
+    os.environ["LANGCHAIN_ENDPOINT"] = _ls.endpoint
+del _ls
+# ── End early LangSmith setup ──────────────────────────────────────────
 
 import logfire
 from fastapi import FastAPI
@@ -12,9 +28,26 @@ from app.assessment.router import router as assessment_router
 from app.knowledge_base.router import router as knowledge_base_router
 from app.insights.router import router as insights_router
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Verify LangSmith is actually reachable at startup
+    settings = get_settings()
+    if settings.langsmith.tracing and settings.langsmith.api_key:
+        try:
+            from langsmith import Client
+
+            ls_client = Client()
+            # Lightweight check — no data transfer
+            if ls_client.info is not None:
+                logger.info("LangSmith connection verified")
+            else:
+                logger.warning("LangSmith returned no server info")
+        except Exception:
+            logger.exception("LangSmith connection check failed")
+
     yield
     await get_engine().dispose()
 
@@ -35,17 +68,19 @@ def create_app() -> FastAPI:
         logfire.configure(send_to_logfire=False)
     logfire.instrument_fastapi(application)
 
-    # LangSmith — set env vars so the SDK picks them up
+    # Log LangSmith status (env vars already set at module level above)
     if settings.langsmith.tracing and settings.langsmith.api_key:
-        from langsmith import utils as ls_utils
-
-        ls_utils.tracing_is_enabled()  # trigger import
-        import os
-
-        os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
-        os.environ.setdefault("LANGCHAIN_API_KEY", settings.langsmith.api_key)
-        os.environ.setdefault("LANGCHAIN_PROJECT", settings.langsmith.project)
-        os.environ.setdefault("LANGCHAIN_ENDPOINT", settings.langsmith.endpoint)
+        logger.info(
+            "LangSmith tracing enabled — project=%s endpoint=%s",
+            settings.langsmith.project,
+            settings.langsmith.endpoint,
+        )
+    else:
+        logger.warning(
+            "LangSmith tracing disabled (tracing=%s, api_key set=%s)",
+            settings.langsmith.tracing,
+            bool(settings.langsmith.api_key),
+        )
 
     application.add_middleware(
         CORSMiddleware,

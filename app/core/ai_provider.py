@@ -1,3 +1,5 @@
+import logging
+import os
 from functools import lru_cache
 
 from openai import AsyncOpenAI
@@ -6,6 +8,8 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache
@@ -25,9 +29,25 @@ def get_openai_client() -> AsyncOpenAI:
     client = AsyncOpenAI(api_key=settings.openai.api_key)
 
     if settings.langsmith.tracing and settings.langsmith.api_key:
+        # Clear lru_cache on get_env_var so langsmith sees our env vars
+        from langsmith.utils import get_env_var
+
+        get_env_var.cache_clear()
+
         from langsmith.wrappers import wrap_openai
 
         client = wrap_openai(client)
+
+        from langsmith.utils import tracing_is_enabled
+
+        logger.info(
+            "OpenAI client wrapped with LangSmith tracing "
+            "(tracing_is_enabled=%s, LANGCHAIN_TRACING_V2=%s)",
+            tracing_is_enabled(),
+            os.environ.get("LANGCHAIN_TRACING_V2"),
+        )
+    else:
+        logger.info("OpenAI client created without LangSmith wrapping")
 
     return client
 
