@@ -20,18 +20,27 @@ TEST_API_KEY = "test-api-key-for-testing-only"
 
 
 def _test_settings() -> Settings:
+    from app.core.config import (
+        LangSmithConfig,
+        LogfireConfig,
+        OpenAIConfig,
+        PineconeConfig,
+    )
+
     return Settings(
         API_KEY=TEST_API_KEY,
         SUPABASE_JWT_SECRET=TEST_JWT_SECRET,
         DATABASE_URL="postgresql+asyncpg://test:test@localhost:5432/test",
         ALLOWED_ORIGINS=["http://localhost:5173"],
-        OPENAI_API_KEY="test-openai-key",
-        PINECONE_API_KEY="test-pinecone-key",
-        PINECONE_INDEX_NAME="test-index",
-        PINECONE_CLOUD="aws",
-        PINECONE_REGION="us-east-1",
-        LOGFIRE_TOKEN="",
-        LOGFIRE_SEND_TO_LOGFIRE=False,
+        openai=OpenAIConfig(api_key="test-openai-key"),
+        pinecone=PineconeConfig(
+            api_key="test-pinecone-key",
+            index_name="test-index",
+            cloud="aws",
+            region="us-east-1",
+        ),
+        logfire=LogfireConfig(token="", send_to_logfire=False),
+        langsmith=LangSmithConfig(api_key="", project="test", tracing=False),
     )
 
 

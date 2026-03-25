@@ -25,15 +25,27 @@ def create_app() -> FastAPI:
     settings = get_settings()
 
     # Logfire observability
-    if settings.LOGFIRE_TOKEN:
+    if settings.logfire.token:
         logfire.configure(
             service_name="kynesis-api",
-            token=settings.LOGFIRE_TOKEN,
+            token=settings.logfire.token,
             send_to_logfire=True,
         )
     else:
         logfire.configure(send_to_logfire=False)
     logfire.instrument_fastapi(application)
+
+    # LangSmith — set env vars so the SDK picks them up
+    if settings.langsmith.tracing and settings.langsmith.api_key:
+        from langsmith import utils as ls_utils
+
+        ls_utils.tracing_is_enabled()  # trigger import
+        import os
+
+        os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+        os.environ.setdefault("LANGCHAIN_API_KEY", settings.langsmith.api_key)
+        os.environ.setdefault("LANGCHAIN_PROJECT", settings.langsmith.project)
+        os.environ.setdefault("LANGCHAIN_ENDPOINT", settings.langsmith.endpoint)
 
     application.add_middleware(
         CORSMiddleware,

@@ -28,9 +28,16 @@ def _mock_ai_output():
     from app.assessment.services import AICriterionOutput, AIScoreOutput
 
     return AIScoreOutput(
+        content_analysis="A document with clear structure.",
         criteria=[
-            AICriterionOutput(criterion_id="c1", score=8, comment="Clear writing.", suggestions=None),
-            AICriterionOutput(criterion_id="c2", score=6, comment="Mostly accurate.", suggestions="Double check facts."),
+            AICriterionOutput(
+                criterion_id="c1", score=8, comment="Clear writing.", suggestions=None,
+                evidence=["Direct quote from content"], reasoning="Evidence shows clarity.",
+            ),
+            AICriterionOutput(
+                criterion_id="c2", score=6, comment="Mostly accurate.", suggestions="Double check facts.",
+                evidence=["Relevant passage found"], reasoning="Some inaccuracies noted.",
+            ),
         ],
         summary="Good overall performance.",
     )
@@ -111,9 +118,12 @@ async def test_assessment_passed_threshold(async_client: AsyncClient):
     from app.assessment.services import AICriterionOutput, AIScoreOutput
 
     ai_output = AIScoreOutput(
+        content_analysis="Test content.",
         criteria=[
-            AICriterionOutput(criterion_id="c1", score=5, comment="Okay.", suggestions="Improve."),
-            AICriterionOutput(criterion_id="c2", score=5, comment="Okay.", suggestions="Improve."),
+            AICriterionOutput(criterion_id="c1", score=5, comment="Okay.", suggestions="Improve.",
+                              evidence=["Some evidence"], reasoning="Below threshold."),
+            AICriterionOutput(criterion_id="c2", score=5, comment="Okay.", suggestions="Improve.",
+                              evidence=["Some evidence"], reasoning="Below threshold."),
         ],
         summary="Needs work.",
     )
@@ -142,9 +152,12 @@ async def test_assessment_weighted_score_calculation(async_client: AsyncClient):
     # c2: score=5/10, weight=2 → contributes 1.0
     # total_weight=5, weighted_sum=4.0, score = 4.0/5 * 100 = 80.0
     ai_output = AIScoreOutput(
+        content_analysis="Test content.",
         criteria=[
-            AICriterionOutput(criterion_id="c1", score=10, comment="Perfect.", suggestions=None),
-            AICriterionOutput(criterion_id="c2", score=5, comment="Half.", suggestions="More."),
+            AICriterionOutput(criterion_id="c1", score=10, comment="Perfect.", suggestions=None,
+                              evidence=["Perfect evidence"], reasoning="Fully meets criterion."),
+            AICriterionOutput(criterion_id="c2", score=5, comment="Half.", suggestions="More.",
+                              evidence=["Partial evidence"], reasoning="Only partially meets criterion."),
         ],
         summary="Mixed.",
     )

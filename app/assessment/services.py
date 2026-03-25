@@ -17,20 +17,73 @@ from app.assessment.schemas import (
 from app.core.ai_provider import get_ai_model
 
 
+# --- Chain-of-Thought structured output ---
+# The AI must fill fields in order: evidence → reasoning → score → comment → suggestions
+# This forces the model to THINK before SCORING.
+
+
 class AICriterionOutput(BaseModel):
-    """What the AI must produce for each criterion."""
+    """Chain-of-thought output per criterion. Fields are ordered to force reasoning before scoring."""
 
     criterion_id: str
-    score: float = Field(ge=0)
-    comment: str
-    suggestions: str | None = None
+
+    # Step 1: Extract — what raw evidence exists in the content?
+    evidence: list[str] = Field(
+        description=(
+            "Direct quotes, timestamps, or data points from the content relevant to this criterion. "
+            "Each item must be a verbatim excerpt or precise observation. "
+            "If timestamps exist, include calculated durations (e.g., '10:00:47Z to 10:01:05Z = 18 seconds')."
+        ),
+    )
+
+    # Step 2: Reason — what does the evidence mean?
+    reasoning: str = Field(
+        description=(
+            "Analysis of the evidence against the criterion. "
+            "What does the evidence prove? What is missing? Any contradictions? "
+            "This MUST be written before deciding on a score."
+        ),
+    )
+
+    # Step 3: Score — only after evidence + reasoning
+    score: float = Field(
+        ge=0,
+        description="Score based ONLY on what the evidence and reasoning support.",
+    )
+
+    # Step 4: Comment — human-readable summary
+    comment: str = Field(
+        description="Concise assessment referencing specific evidence. No claims without backing.",
+    )
+
+    # Step 5: Suggest — actionable improvements
+    suggestions: str | None = Field(
+        default=None,
+        description="Concrete suggestions if score < max_score. Null if score is perfect.",
+    )
 
 
 class AIScoreOutput(BaseModel):
-    """Structured output the AI agent must produce."""
+    """Full chain-of-thought assessment output."""
+
+    # Think first: overall observations before per-criterion analysis
+    content_analysis: str = Field(
+        description=(
+            "Brief factual summary of the content: type, length, key participants, "
+            "timeline (if timestamps present), and any notable structural features. "
+            "This grounds the entire assessment in observable facts."
+        ),
+    )
 
     criteria: list[AICriterionOutput]
-    summary: str
+
+    # Synthesize after all criteria are evaluated
+    summary: str = Field(
+        description=(
+            "Executive summary synthesizing patterns across all criteria. "
+            "Reference the strongest and weakest areas with specific evidence."
+        ),
+    )
 
 
 @dataclass
@@ -39,23 +92,44 @@ class AssessmentDeps:
     knowledge_base_context: str | None = None
 
 
+SYSTEM_PROMPT = (
+    "You are a rigorous QA auditor performing evidence-based assessments.\n\n"
+
+    "## CHAIN-OF-THOUGHT PROCESS\n\n"
+    "You MUST think step-by-step for every criterion. The structured output enforces this:\n\n"
+    "1. **content_analysis** — First, summarize what you're looking at: content type, "
+    "participants, timeline, length. Establish facts before judging.\n\n"
+    "2. For EACH criterion:\n"
+    "   a. **evidence** — Extract ALL relevant quotes, timestamps, data points verbatim. "
+    "If timestamps exist, CALCULATE exact durations (e.g., '10:00:47Z → 10:01:32Z = 45s'). "
+    "Never paraphrase when you can quote.\n"
+    "   b. **reasoning** — Analyze what the evidence proves and what's missing. "
+    "Check for contradictions. This is your thinking step — be thorough.\n"
+    "   c. **score** — Only NOW assign a score, justified by your reasoning. "
+    "No evidence = low score, not an optimistic guess.\n"
+    "   d. **comment** — Summarize for a human reader. Every claim must trace back to evidence.\n"
+    "   e. **suggestions** — Actionable improvements tied to specific gaps. Null only if perfect.\n\n"
+    "3. **summary** — After ALL criteria, synthesize cross-cutting patterns.\n\n"
+
+    "## CRITICAL RULES\n\n"
+    "- NEVER claim something happened without a matching entry in your evidence list.\n"
+    "- If timestamps are present, you MUST compute actual time differences. "
+    "'Responded quickly' is NOT acceptable — '18 seconds' IS.\n"
+    "- Your reasoning field must be filled BEFORE your score. If your reasoning "
+    "contradicts your score, fix the score.\n"
+    "- When evidence is ambiguous or absent, state that explicitly and score conservatively.\n"
+    "- Cross-verify: after writing your comment, re-read your evidence list. "
+    "If the comment claims something not in the evidence, delete the claim.\n"
+)
+
+
 def _build_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
     agent = Agent(
         get_ai_model(),
         output_type=AIScoreOutput,
         deps_type=AssessmentDeps,
         retries=3,
-        system_prompt=(
-            "You are an expert QA evaluator. You evaluate content against scorecard criteria "
-            "and produce structured assessment scores.\n\n"
-            "For each criterion, you MUST:\n"
-            "1. Read the criterion name and description carefully\n"
-            "2. Evaluate the provided content against that criterion\n"
-            "3. Assign a score from 0 to the criterion's max_score\n"
-            "4. Provide a specific comment citing evidence from the content\n"
-            "5. Provide actionable suggestions if the score is not perfect, otherwise set suggestions to null\n\n"
-            "Be fair, precise, and cite specific examples from the content."
-        ),
+        system_prompt=SYSTEM_PROMPT,
     )
 
     @agent.system_prompt
@@ -104,6 +178,12 @@ def _build_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
                 raise ValueError(
                     f"Score {score.score} for '{criterion.name}' exceeds "
                     f"max_score {criterion.max_score}. Please correct."
+                )
+            # Validate evidence is not empty
+            if not score.evidence:
+                raise ValueError(
+                    f"Criterion '{criterion.name}' has no evidence extracted. "
+                    f"You must cite specific content before scoring."
                 )
 
         return result

@@ -2,6 +2,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ENV = os.getenv("ENV", "dev")
@@ -19,10 +20,34 @@ def _env_files() -> tuple[str, ...]:
     return tuple(files) or (".env",)
 
 
+class OpenAIConfig(BaseModel):
+    api_key: str = ""
+
+
+class PineconeConfig(BaseModel):
+    api_key: str = ""
+    index_name: str = "kynesis-kb"
+    cloud: str = "aws"
+    region: str = "us-east-1"
+
+
+class LogfireConfig(BaseModel):
+    token: str = ""
+    send_to_logfire: bool = False
+
+
+class LangSmithConfig(BaseModel):
+    api_key: str = ""
+    project: str = "kynesis"
+    tracing: bool = False
+    endpoint: str = "https://api.smith.langchain.com"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_files(),
         env_file_encoding="utf-8",
+        env_nested_delimiter="__",
     )
 
     # Environment
@@ -32,23 +57,16 @@ class Settings(BaseSettings):
     # API Key auth
     API_KEY: str = ""
 
-    # Existing (retained for future use)
+    # Retained for future use
     SUPABASE_JWT_SECRET: str = ""
     DATABASE_URL: str = ""
     ALLOWED_ORIGINS: list[str] = ["http://localhost:5173"]
 
-    # AI Provider
-    OPENAI_API_KEY: str = ""
-
-    # Pinecone
-    PINECONE_API_KEY: str = ""
-    PINECONE_INDEX_NAME: str = "kynesis-kb"
-    PINECONE_CLOUD: str = "aws"
-    PINECONE_REGION: str = "us-east-1"
-
-    # Logfire
-    LOGFIRE_TOKEN: str = ""
-    LOGFIRE_SEND_TO_LOGFIRE: bool = False
+    # Service configs
+    openai: OpenAIConfig = OpenAIConfig()
+    pinecone: PineconeConfig = PineconeConfig()
+    logfire: LogfireConfig = LogfireConfig()
+    langsmith: LangSmithConfig = LangSmithConfig()
 
 
 @lru_cache

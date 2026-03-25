@@ -19,6 +19,9 @@ dependencies = [
     "python-docx",
     "langchain-text-splitters",
     "python-multipart",
+    "langsmith>=0.7.22",
+    "opentelemetry-sdk>=1.39.1",
+    "opentelemetry-exporter-otlp>=1.39.1",
 ]
 
 [project.optional-dependencies]

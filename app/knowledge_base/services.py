@@ -31,8 +31,9 @@ def _get_text_splitter() -> RecursiveCharacterTextSplitter:
 
 
 async def _generate_embeddings(texts: list[str]) -> list[list[float]]:
-    settings = get_settings()
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    from app.core.ai_provider import get_openai_client
+
+    client = get_openai_client()
 
     with logfire.span("generate_embeddings", chunk_count=len(texts)):
         response = await client.embeddings.create(
