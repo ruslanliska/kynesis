@@ -9,7 +9,6 @@ from app.assessment.schemas import (
     AssessmentRequest,
     AssessmentResult,
     ContentType,
-    Scorecard,
 )
 from app.assessment.services import run_assessment
 from app.assessment.transcription import (
@@ -19,6 +18,7 @@ from app.assessment.transcription import (
 )
 from app.core.auth import verify_api_key
 from app.core.errors import AIProviderError, AIRateLimitError, ValidationError
+from app.scorecards.schemas import ScorecardDefinition, ScorecardStatus
 
 router = APIRouter(prefix="/api/v1", tags=["assessments"], dependencies=[Depends(verify_api_key)])
 
@@ -27,6 +27,12 @@ async def _run_with_error_handling(
     request: AssessmentRequest,
     knowledge_base_context: str | None = None,
 ) -> AssessmentResult:
+    if request.scorecard.status != ScorecardStatus.active:
+        raise ValidationError(
+            f"Only active scorecards can be used for assessments. "
+            f"Current status: {request.scorecard.status.value!r}."
+        )
+
     if request.use_knowledge_base:
         from app.knowledge_base.services import get_rag_context
 
@@ -77,7 +83,7 @@ async def create_audio_assessment(
     # Parse scorecard JSON from form field
     try:
         scorecard_data = json.loads(scorecard)
-        scorecard_obj = Scorecard.model_validate(scorecard_data)
+        scorecard_obj = ScorecardDefinition.model_validate(scorecard_data)
     except (json.JSONDecodeError, Exception) as e:
         raise ValidationError(f"Invalid scorecard JSON: {e}")
 
