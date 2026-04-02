@@ -18,6 +18,7 @@ from app.assessment.transcription import (
 )
 from app.core.auth import verify_api_key
 from app.core.errors import AIProviderError, AIRateLimitError, ValidationError
+from app.knowledge_base.parsers import SUPPORTED_EXTENSIONS, extract_text
 from app.scorecards.schemas import ScorecardDefinition, ScorecardStatus
 
 router = APIRouter(prefix="/api/v1", tags=["assessments"], dependencies=[Depends(verify_api_key)])
@@ -56,6 +57,56 @@ async def _run_with_error_handling(
 
 @router.post("/assessments", response_model=AssessmentResult, response_model_by_alias=True)
 async def create_assessment(request: AssessmentRequest) -> AssessmentResult:
+    return await _run_with_error_handling(request)
+
+
+MAX_DOCUMENT_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+@router.post("/assessments/document", response_model=AssessmentResult, response_model_by_alias=True)
+async def create_document_assessment(
+    file: UploadFile,
+    scorecard: str = Form(...),
+    use_knowledge_base: bool = Form(False),
+) -> AssessmentResult:
+    if not file.filename:
+        raise ValidationError("File must have a filename.")
+
+    ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in SUPPORTED_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise ValidationError(f"Unsupported file format '{ext}'. Supported: {supported}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise ValidationError("File is empty.")
+    if len(content) > MAX_DOCUMENT_SIZE:
+        raise ValidationError("File exceeds maximum size of 10MB.")
+
+    try:
+        scorecard_data = json.loads(scorecard)
+        scorecard_obj = ScorecardDefinition.model_validate(scorecard_data)
+    except (json.JSONDecodeError, Exception) as e:
+        raise ValidationError(f"Invalid scorecard JSON: {e}")
+
+    try:
+        text = extract_text(file.filename, content)
+    except ValueError as e:
+        raise ValidationError(str(e))
+
+    if len(text) < 50:
+        raise ValidationError(
+            f"Extracted text too short ({len(text)} chars). "
+            "The document may be empty, image-only, or unreadable."
+        )
+
+    request = AssessmentRequest(
+        scorecard=scorecard_obj,
+        content=text,
+        content_type=ContentType.document,
+        use_knowledge_base=use_knowledge_base,
+    )
+
     return await _run_with_error_handling(request)
 
 

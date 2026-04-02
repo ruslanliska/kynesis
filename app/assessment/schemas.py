@@ -22,6 +22,7 @@ class ContentType(str, Enum):
     audio_conversation = "audio_conversation"
     code_review = "code_review"
     document = "document"
+    email = "email"
     other = "other"
 
 
