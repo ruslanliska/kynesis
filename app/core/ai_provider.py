@@ -59,3 +59,21 @@ def get_openai_provider() -> OpenAIProvider:
 
 def get_ai_model(model: str = "gpt-4o") -> OpenAIChatModel:
     return OpenAIChatModel(model, provider=get_openai_provider())
+
+
+@lru_cache
+def get_deepseek_client() -> AsyncOpenAI:
+    settings = get_settings()
+    return AsyncOpenAI(
+        api_key=settings.deepseek.api_key,
+        base_url=settings.deepseek.base_url,
+    )
+
+
+@lru_cache
+def get_deepseek_provider() -> OpenAIProvider:
+    return OpenAIProvider(openai_client=get_deepseek_client())
+
+
+def get_deepseek_model(model: str = "deepseek-reasoner") -> OpenAIChatModel:
+    return OpenAIChatModel(model, provider=get_deepseek_provider())

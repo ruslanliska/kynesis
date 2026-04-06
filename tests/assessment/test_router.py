@@ -12,6 +12,7 @@ SCORECARD_PAYLOAD = {
     "description": "Test",
     "status": "active",
     "scoringMode": "add",
+    "maxScore": 20,
     "passingThreshold": 70,
     "allowQuestionComments": True,
     "allowOverallComment": True,
@@ -203,9 +204,7 @@ async def test_assessment_passed_below_threshold(async_client: AsyncClient):
 
 
 async def test_assessment_weighted_score_calculation(async_client: AsyncClient):
-    # q1 (sec-1, weight=60): yes → 10/10 = 100% → contributes 60.0
-    # q2 (sec-2, weight=40): no → 0/10 = 0% → contributes 0.0
-    # overall = 60.0
+    # q1 yes=10pts, q2 no=0pts → earned=10, maxScore=20 → 50%
     from app.assessment.services import AIQuestionOutput, AIScoreOutput
 
     ai_output = AIScoreOutput(
@@ -238,7 +237,7 @@ async def test_assessment_weighted_score_calculation(async_client: AsyncClient):
         )
 
     data = response.json()
-    assert data["overall"]["score"] == 60.0
+    assert data["overall"]["score"] == 50.0
 
 
 async def test_assessment_overall_pass_fail(async_client: AsyncClient):

@@ -16,6 +16,11 @@ class CamelModel(BaseModel):
     )
 
 
+class AIProvider(str, Enum):
+    openai = "openai"
+    deepseek = "deepseek"
+
+
 class ContentType(str, Enum):
     call_transcript = "call_transcript"
     chat_conversation = "chat_conversation"
@@ -34,6 +39,7 @@ class AssessmentRequest(CamelModel):
     content: str = Field(min_length=50, max_length=100_000)
     content_type: ContentType = ContentType.other
     use_knowledge_base: bool = False
+    provider: AIProvider = AIProvider.openai
 
     @field_validator("content", mode="before")
     @classmethod

@@ -39,7 +39,7 @@ class CriticalType(str, Enum):
 class ScorecardOption(CamelModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     label: str = Field(min_length=1)
-    value: int
+    value: int = 0
     points_change: float
     order_index: int
 
@@ -71,8 +71,10 @@ class ScorecardDefinition(CamelModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     name: str = Field(min_length=1)
     description: str = ""
+    project_id: str | None = None
     status: ScorecardStatus = ScorecardStatus.draft
     scoring_mode: ScoringMode = ScoringMode.add
+    max_score: int = Field(default=100, ge=1)
     passing_threshold: float | None = Field(default=None, ge=0, le=100)
     allow_question_comments: bool = True
     allow_overall_comment: bool = True

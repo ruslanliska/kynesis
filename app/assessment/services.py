@@ -14,11 +14,13 @@ from app.assessment.schemas import (
     QuestionResult,
     SectionResult,
 )
-from app.core.ai_provider import get_ai_model
+from app.assessment.schemas import AIProvider
+from app.core.ai_provider import get_ai_model, get_deepseek_model
 from app.scorecards.schemas import (
     CriticalType,
     ScorecardDefinition,
     ScorecardQuestion,
+    ScoringMode,
     ScoringType,
 )
 
@@ -289,15 +291,27 @@ def get_assessment_agent() -> Agent[AssessmentDeps, AIScoreOutput]:
 def _calculate_question_earned_points(
     ai_q: AIQuestionOutput,
     question: ScorecardQuestion,
+    scoring_mode: ScoringMode,
 ) -> float:
+    """
+    Add mode:    earned = points_change          (0 → max_points)
+    Deduct mode: earned = max_points + points_change  (points_change ≤ 0)
+    Tag-only:    earned = 0 (no score impact)
+    """
     if question.scoring_type in (ScoringType.binary, ScoringType.scale):
         for opt in question.options:
             if opt.id == ai_q.selected_option_id:
-                return float(opt.points_change)
-        return 0.0
+                change = float(opt.points_change)
+                if scoring_mode == ScoringMode.deduct:
+                    earned = float(question.max_points) + change
+                else:
+                    earned = change
+                return max(0.0, min(earned, float(question.max_points)))
+        # Fallback: no match found
+        return float(question.max_points) if scoring_mode == ScoringMode.deduct else 0.0
     elif question.scoring_type == ScoringType.numeric:
-        return float(ai_q.numeric_value or 0.0)
-    else:  # tag_only
+        return max(0.0, min(float(ai_q.numeric_value or 0.0), float(question.max_points)))
+    else:  # tag_only — no score impact
         return 0.0
 
 
@@ -305,10 +319,15 @@ def calculate_scores(
     ai_questions: list[AIQuestionOutput],
     scorecard: ScorecardDefinition,
 ) -> tuple[list[SectionResult], float, bool]:
-    """Return (section_results, overall_score_0_to_100, hard_critical_failure)."""
+    """Return (section_results, overall_score_0_to_100, hard_critical_failure).
+
+    Overall score = total_earned / scorecard.max_score * 100.
+    Section scores are for display only (earned / section_max_points * 100).
+    Tag-only questions contribute 0 to both earned and max, so they are excluded.
+    """
     ai_map = {q.question_id: q for q in ai_questions}
     section_results: list[SectionResult] = []
-    section_scores: list[float] = []
+    total_earned = 0.0
     hard_critical_failure = False
 
     for section in scorecard.sections:
@@ -317,34 +336,26 @@ def calculate_scores(
 
         for question in section.questions:
             ai_q = ai_map[question.id]
-            earned = _calculate_question_earned_points(ai_q, question)
+            earned = _calculate_question_earned_points(ai_q, question, scorecard.scoring_mode)
             section_earned += earned
             section_max += question.max_points
 
             if question.critical == CriticalType.hard and earned == 0 and question.max_points > 0:
                 hard_critical_failure = True
 
-        section_score = (section_earned / section_max * 100) if section_max > 0 else 100.0
+        total_earned += section_earned
+        raw_section = (section_earned / section_max * 100) if section_max > 0 else 100.0
         section_results.append(
             SectionResult(
                 section_id=section.id,
                 section_name=section.name,
-                score=round(section_score, 1),
+                score=round(max(0.0, min(raw_section, 100.0)), 1),
                 weight=section.weight,
             )
         )
-        section_scores.append(section_score)
 
-    # Overall score
-    weights = [s.weight for s in scorecard.sections]
-    if section_scores and all(w is not None for w in weights):
-        overall = sum(score * w / 100 for score, w in zip(section_scores, weights))  # type: ignore[arg-type]
-    elif section_scores:
-        overall = sum(section_scores) / len(section_scores)
-    else:
-        overall = 0.0
-
-    return section_results, round(overall, 1), hard_critical_failure
+    overall = (total_earned / scorecard.max_score * 100) if scorecard.max_score > 0 else 0.0
+    return section_results, round(max(0.0, min(overall, 100.0)), 1), hard_critical_failure
 
 
 async def run_assessment(
@@ -359,12 +370,14 @@ async def run_assessment(
 
         prompt = f"Evaluate the following content:\n\n{request.content}"
 
-        agent = get_assessment_agent()
-        result = await agent.run(
-            prompt,
-            deps=deps,
-            model=get_ai_model(),
+        model = (
+            get_deepseek_model()
+            if request.provider == AIProvider.deepseek
+            else get_ai_model()
         )
+
+        agent = get_assessment_agent()
+        result = await agent.run(prompt, deps=deps, model=model)
 
         ai_output = result.output
         section_results, overall_score, hard_critical_failure = calculate_scores(
@@ -377,7 +390,7 @@ async def run_assessment(
         for section in request.scorecard.sections:
             for question in section.questions:
                 ai_q = ai_map[question.id]
-                earned = _calculate_question_earned_points(ai_q, question)
+                earned = _calculate_question_earned_points(ai_q, question, request.scorecard.scoring_mode)
                 question_results.append(
                     QuestionResult(
                         question_id=question.id,

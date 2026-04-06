@@ -24,6 +24,11 @@ class OpenAIConfig(BaseModel):
     api_key: str = ""
 
 
+class DeepSeekConfig(BaseModel):
+    api_key: str = ""
+    base_url: str = "https://api.deepseek.com/v1"
+
+
 class PineconeConfig(BaseModel):
     api_key: str = ""
     index_name: str = "kynesis-kb"
@@ -64,6 +69,7 @@ class Settings(BaseSettings):
 
     # Service configs
     openai: OpenAIConfig = OpenAIConfig()
+    deepseek: DeepSeekConfig = DeepSeekConfig()
     pinecone: PineconeConfig = PineconeConfig()
     logfire: LogfireConfig = LogfireConfig()
     langsmith: LangSmithConfig = LangSmithConfig()

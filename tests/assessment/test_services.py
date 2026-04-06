@@ -6,6 +6,7 @@ from app.scorecards.schemas import (
     ScorecardQuestion,
     ScorecardSection,
     ScorecardStatus,
+    ScoringMode,
     ScoringType,
 )
 
@@ -17,7 +18,18 @@ def _binary_question(
     qid: str,
     max_points: int,
     critical: CriticalType = CriticalType.none,
+    mode: ScoringMode = ScoringMode.add,
 ) -> ScorecardQuestion:
+    if mode == ScoringMode.deduct:
+        options = [
+            ScorecardOption(id=f"{qid}-yes", label="Yes", points_change=0, order_index=0),
+            ScorecardOption(id=f"{qid}-no", label="No", points_change=-max_points, order_index=1),
+        ]
+    else:
+        options = [
+            ScorecardOption(id=f"{qid}-yes", label="Yes", points_change=max_points, order_index=0),
+            ScorecardOption(id=f"{qid}-no", label="No", points_change=0, order_index=1),
+        ]
     return ScorecardQuestion(
         id=qid,
         text=f"Question {qid}",
@@ -27,21 +39,21 @@ def _binary_question(
         required=True,
         critical=critical,
         order_index=0,
-        options=[
-            ScorecardOption(id=f"{qid}-yes", label="Yes", value=1, points_change=max_points, order_index=0),
-            ScorecardOption(id=f"{qid}-no", label="No", value=0, points_change=0, order_index=1),
-        ],
+        options=options,
     )
 
 
 def _scorecard(
     sections: list[tuple[str, float | None, list[ScorecardQuestion]]],
+    max_score: int = 100,
+    mode: ScoringMode = ScoringMode.add,
 ) -> ScorecardDefinition:
-    """Create a ScorecardDefinition from (section_id, weight, questions) tuples."""
     return ScorecardDefinition(
         id="sc-1",
         name="Test",
         status=ScorecardStatus.active,
+        scoring_mode=mode,
+        max_score=max_score,
         sections=[
             ScorecardSection(
                 id=sid,
@@ -66,100 +78,109 @@ def _ai_q(question_id: str, selected_option_id: str) -> AIQuestionOutput:
     )
 
 
-# --- Score calculation tests ---
+# --- Add mode tests ---
 
 
-def test_weighted_score_perfect():
+def test_add_perfect():
+    # q1=20pts, q2=30pts, q3=50pts → total=100, maxScore=100 → 100%
     sc = _scorecard([
-        ("s1", 60.0, [_binary_question("q1", 10)]),
-        ("s2", 40.0, [_binary_question("q2", 10)]),
-    ])
-    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-yes")]
+        ("s1", 30.0, [_binary_question("q1", 20), _binary_question("q2", 30)]),
+        ("s2", 70.0, [_binary_question("q3", 50)]),
+    ], max_score=100)
+    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-yes"), _ai_q("q3", "q3-yes")]
     _, overall, hcf = calculate_scores(ai, sc)
     assert overall == 100.0
     assert hcf is False
 
 
-def test_weighted_score_zero():
+def test_add_zero():
     sc = _scorecard([
-        ("s1", 60.0, [_binary_question("q1", 10)]),
-        ("s2", 40.0, [_binary_question("q2", 10)]),
-    ])
-    ai = [_ai_q("q1", "q1-no"), _ai_q("q2", "q2-no")]
+        ("s1", 30.0, [_binary_question("q1", 20), _binary_question("q2", 30)]),
+        ("s2", 70.0, [_binary_question("q3", 50)]),
+    ], max_score=100)
+    ai = [_ai_q("q1", "q1-no"), _ai_q("q2", "q2-no"), _ai_q("q3", "q3-no")]
     _, overall, _ = calculate_scores(ai, sc)
     assert overall == 0.0
 
 
-def test_weighted_score_mixed():
-    # s1: 10/10 = 100%, weight=60 → 60.0
-    # s2: 0/10 = 0%, weight=40 → 0.0
-    # overall = 60.0
+def test_add_partial():
+    # q1 yes=20, q2 no=0, q3 yes=50 → earned=70, maxScore=100 → 70%
     sc = _scorecard([
-        ("s1", 60.0, [_binary_question("q1", 10)]),
-        ("s2", 40.0, [_binary_question("q2", 10)]),
-    ])
-    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no")]
+        ("s1", 30.0, [_binary_question("q1", 20), _binary_question("q2", 30)]),
+        ("s2", 70.0, [_binary_question("q3", 50)]),
+    ], max_score=100)
+    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no"), _ai_q("q3", "q3-yes")]
+    _, overall, _ = calculate_scores(ai, sc)
+    assert overall == 70.0
+
+
+# --- Deduct mode tests ---
+
+
+def test_deduct_perfect():
+    # No deductions → 100%
+    sc = _scorecard([
+        ("s1", 50.0, [_binary_question("q1", 40, mode=ScoringMode.deduct),
+                      _binary_question("q2", 30, mode=ScoringMode.deduct)]),
+        ("s2", 50.0, [_binary_question("q3", 30, mode=ScoringMode.deduct)]),
+    ], max_score=100, mode=ScoringMode.deduct)
+    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-yes"), _ai_q("q3", "q3-yes")]
+    _, overall, _ = calculate_scores(ai, sc)
+    assert overall == 100.0
+
+
+def test_deduct_partial():
+    # q1 violated (-40), rest pass → earned: 0+30+30=60, maxScore=100 → 60%
+    sc = _scorecard([
+        ("s1", 50.0, [_binary_question("q1", 40, mode=ScoringMode.deduct),
+                      _binary_question("q2", 30, mode=ScoringMode.deduct)]),
+        ("s2", 50.0, [_binary_question("q3", 30, mode=ScoringMode.deduct)]),
+    ], max_score=100, mode=ScoringMode.deduct)
+    ai = [_ai_q("q1", "q1-no"), _ai_q("q2", "q2-yes"), _ai_q("q3", "q3-yes")]
     _, overall, _ = calculate_scores(ai, sc)
     assert overall == 60.0
 
 
-def test_equal_weight_sections():
-    # No weights defined → mean of section scores
-    # s1: 10/10 = 100%, s2: 0/10 = 0% → mean = 50.0
-    sc = _scorecard([
-        ("s1", None, [_binary_question("q1", 10)]),
-        ("s2", None, [_binary_question("q2", 10)]),
-    ])
-    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no")]
-    _, overall, _ = calculate_scores(ai, sc)
-    assert overall == 50.0
+# --- Section display scores ---
 
 
-def test_section_results_scores():
+def test_section_scores_add():
     sc = _scorecard([
-        ("s1", 60.0, [_binary_question("q1", 10)]),
-        ("s2", 40.0, [_binary_question("q2", 10)]),
-    ])
-    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no")]
+        ("s1", 30.0, [_binary_question("q1", 20), _binary_question("q2", 30)]),
+        ("s2", 70.0, [_binary_question("q3", 50)]),
+    ], max_score=100)
+    # s1: q1 yes, q2 no → 20/50 = 40%; s2: q3 yes → 50/50 = 100%
+    ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no"), _ai_q("q3", "q3-yes")]
     sections, _, _ = calculate_scores(ai, sc)
-    assert sections[0].section_id == "s1"
-    assert sections[0].score == 100.0
-    assert sections[1].section_id == "s2"
-    assert sections[1].score == 0.0
+    assert sections[0].score == 40.0
+    assert sections[1].score == 100.0
+
+
+# --- Critical failure tests ---
 
 
 def test_hard_critical_failure_when_scored_zero():
     sc = _scorecard([
-        ("s1", 100.0, [_binary_question("q1", 10, critical=CriticalType.hard)]),
-    ])
-    ai = [_ai_q("q1", "q1-no")]  # 0 points
+        ("s1", None, [_binary_question("q1", 10, critical=CriticalType.hard)]),
+    ], max_score=10)
+    ai = [_ai_q("q1", "q1-no")]
     _, _, hcf = calculate_scores(ai, sc)
     assert hcf is True
 
 
 def test_hard_critical_not_triggered_when_nonzero():
     sc = _scorecard([
-        ("s1", 100.0, [_binary_question("q1", 10, critical=CriticalType.hard)]),
-    ])
-    ai = [_ai_q("q1", "q1-yes")]  # full points
+        ("s1", None, [_binary_question("q1", 10, critical=CriticalType.hard)]),
+    ], max_score=10)
+    ai = [_ai_q("q1", "q1-yes")]
     _, _, hcf = calculate_scores(ai, sc)
     assert hcf is False
 
 
 def test_soft_critical_does_not_trigger_hard_failure():
     sc = _scorecard([
-        ("s1", 100.0, [_binary_question("q1", 10, critical=CriticalType.soft)]),
-    ])
-    ai = [_ai_q("q1", "q1-no")]  # 0 points, but soft
+        ("s1", None, [_binary_question("q1", 10, critical=CriticalType.soft)]),
+    ], max_score=10)
+    ai = [_ai_q("q1", "q1-no")]
     _, _, hcf = calculate_scores(ai, sc)
     assert hcf is False
-
-
-def test_single_section_single_question():
-    sc = _scorecard([
-        ("s1", None, [_binary_question("q1", 10)]),
-    ])
-    ai = [_ai_q("q1", "q1-yes")]
-    sections, overall, _ = calculate_scores(ai, sc)
-    assert overall == 100.0
-    assert sections[0].score == 100.0
