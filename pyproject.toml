@@ -22,6 +22,9 @@ dependencies = [
     "langsmith>=0.7.22",
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp>=1.39.1",
+    "langchain-openai>=1.1.12",
+    "langchain-core>=1.2.22",
+    "langchain-deepseek>=1.0.1",
 ]
 
 [project.optional-dependencies]

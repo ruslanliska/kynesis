@@ -4,13 +4,13 @@ import fitz  # pymupdf
 from docx import Document
 
 
-def parse_pdf(content: bytes) -> str:
+def parse_pdf(content: bytes) -> tuple[str, int]:
+    """Return (extracted_text, page_count)."""
     doc = fitz.open(stream=content, filetype="pdf")
-    text_parts = []
-    for page in doc:
-        text_parts.append(page.get_text())
+    text_parts = [page.get_text() for page in doc]
+    page_count = len(doc)
     doc.close()
-    return "\n".join(text_parts)
+    return "\n".join(text_parts), page_count
 
 
 def parse_docx(content: bytes) -> str:
@@ -30,20 +30,16 @@ def parse_markdown(content: bytes) -> str:
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".docx", ".md"}
 
-PARSERS = {
-    ".pdf": parse_pdf,
-    ".txt": parse_txt,
-    ".docx": parse_docx,
-    ".md": parse_markdown,
-}
-
 
 def extract_text(filename: str, content: bytes) -> str:
+    """Extract text from a document file. Does NOT handle images or OCR."""
     ext = Path(filename).suffix.lower()
-    parser = PARSERS.get(ext)
+    if ext == ".pdf":
+        text, _ = parse_pdf(content)
+        return text
+    parsers = {".txt": parse_txt, ".docx": parse_docx, ".md": parse_markdown}
+    parser = parsers.get(ext)
     if parser is None:
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        raise ValueError(
-            f"Unsupported file format '{ext}'. Supported: {supported}."
-        )
+        raise ValueError(f"Unsupported file format '{ext}'. Supported: {supported}.")
     return parser(content)

@@ -88,7 +88,7 @@ def test_add_perfect():
         ("s2", 70.0, [_binary_question("q3", 50)]),
     ], max_score=100)
     ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-yes"), _ai_q("q3", "q3-yes")]
-    _, overall, hcf = calculate_scores(ai, sc)
+    _, overall, _, hcf = calculate_scores(ai, sc)
     assert overall == 100.0
     assert hcf is False
 
@@ -99,7 +99,7 @@ def test_add_zero():
         ("s2", 70.0, [_binary_question("q3", 50)]),
     ], max_score=100)
     ai = [_ai_q("q1", "q1-no"), _ai_q("q2", "q2-no"), _ai_q("q3", "q3-no")]
-    _, overall, _ = calculate_scores(ai, sc)
+    _, overall, _, _ = calculate_scores(ai, sc)
     assert overall == 0.0
 
 
@@ -110,7 +110,7 @@ def test_add_partial():
         ("s2", 70.0, [_binary_question("q3", 50)]),
     ], max_score=100)
     ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no"), _ai_q("q3", "q3-yes")]
-    _, overall, _ = calculate_scores(ai, sc)
+    _, overall, _, _ = calculate_scores(ai, sc)
     assert overall == 70.0
 
 
@@ -125,7 +125,7 @@ def test_deduct_perfect():
         ("s2", 50.0, [_binary_question("q3", 30, mode=ScoringMode.deduct)]),
     ], max_score=100, mode=ScoringMode.deduct)
     ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-yes"), _ai_q("q3", "q3-yes")]
-    _, overall, _ = calculate_scores(ai, sc)
+    _, overall, _, _ = calculate_scores(ai, sc)
     assert overall == 100.0
 
 
@@ -137,7 +137,7 @@ def test_deduct_partial():
         ("s2", 50.0, [_binary_question("q3", 30, mode=ScoringMode.deduct)]),
     ], max_score=100, mode=ScoringMode.deduct)
     ai = [_ai_q("q1", "q1-no"), _ai_q("q2", "q2-yes"), _ai_q("q3", "q3-yes")]
-    _, overall, _ = calculate_scores(ai, sc)
+    _, overall, _, _ = calculate_scores(ai, sc)
     assert overall == 60.0
 
 
@@ -151,7 +151,7 @@ def test_section_scores_add():
     ], max_score=100)
     # s1: q1 yes, q2 no → 20/50 = 40%; s2: q3 yes → 50/50 = 100%
     ai = [_ai_q("q1", "q1-yes"), _ai_q("q2", "q2-no"), _ai_q("q3", "q3-yes")]
-    sections, _, _ = calculate_scores(ai, sc)
+    sections, _, _, _ = calculate_scores(ai, sc)
     assert sections[0].score == 40.0
     assert sections[1].score == 100.0
 
@@ -164,7 +164,7 @@ def test_hard_critical_failure_when_scored_zero():
         ("s1", None, [_binary_question("q1", 10, critical=CriticalType.hard)]),
     ], max_score=10)
     ai = [_ai_q("q1", "q1-no")]
-    _, _, hcf = calculate_scores(ai, sc)
+    _, _, _, hcf = calculate_scores(ai, sc)
     assert hcf is True
 
 
@@ -173,7 +173,7 @@ def test_hard_critical_not_triggered_when_nonzero():
         ("s1", None, [_binary_question("q1", 10, critical=CriticalType.hard)]),
     ], max_score=10)
     ai = [_ai_q("q1", "q1-yes")]
-    _, _, hcf = calculate_scores(ai, sc)
+    _, _, _, hcf = calculate_scores(ai, sc)
     assert hcf is False
 
 
@@ -182,5 +182,5 @@ def test_soft_critical_does_not_trigger_hard_failure():
         ("s1", None, [_binary_question("q1", 10, critical=CriticalType.soft)]),
     ], max_score=10)
     ai = [_ai_q("q1", "q1-no")]
-    _, _, hcf = calculate_scores(ai, sc)
+    _, _, _, hcf = calculate_scores(ai, sc)
     assert hcf is False

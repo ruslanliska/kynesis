@@ -75,7 +75,7 @@ class ScorecardDefinition(CamelModel):
     status: ScorecardStatus = ScorecardStatus.draft
     scoring_mode: ScoringMode = ScoringMode.add
     max_score: int = Field(default=100, ge=1)
-    passing_threshold: float | None = Field(default=None, ge=0, le=100)
+    passing_threshold: float | None = Field(default=None, ge=0)
     allow_question_comments: bool = True
     allow_overall_comment: bool = True
     show_points_to_evaluator: bool = True

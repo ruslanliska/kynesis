@@ -3,7 +3,8 @@ import json
 import logfire
 from fastapi import APIRouter, Depends, Form, UploadFile
 from httpx import ConnectError, HTTPStatusError
-from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
+from langchain_core.exceptions import LangChainException
+from openai import APIConnectionError, RateLimitError
 
 from app.assessment.schemas import (
     AssessmentRequest,
@@ -11,6 +12,12 @@ from app.assessment.schemas import (
     ContentType,
 )
 from app.assessment.services import run_assessment
+from app.assessment.ocr import (
+    SUPPORTED_IMAGE_EXTENSIONS,
+    is_sparse_pdf,
+    ocr_image,
+    ocr_pdf,
+)
 from app.assessment.transcription import (
     MAX_AUDIO_SIZE,
     SUPPORTED_AUDIO_EXTENSIONS,
@@ -18,7 +25,7 @@ from app.assessment.transcription import (
 )
 from app.core.auth import verify_api_key
 from app.core.errors import AIProviderError, AIRateLimitError, ValidationError
-from app.knowledge_base.parsers import SUPPORTED_EXTENSIONS, extract_text
+from app.knowledge_base.parsers import SUPPORTED_EXTENSIONS, parse_pdf, extract_text
 from app.scorecards.schemas import ScorecardDefinition, ScorecardStatus
 
 router = APIRouter(prefix="/api/v1", tags=["assessments"], dependencies=[Depends(verify_api_key)])
@@ -44,15 +51,15 @@ async def _run_with_error_handling(
 
     try:
         return await run_assessment(request, knowledge_base_context)
-    except UnexpectedModelBehavior as e:
-        logfire.error("AI model returned invalid output", error=str(e))
-        raise AIProviderError()
-    except UsageLimitExceeded as e:
-        logfire.warn("AI usage limit exceeded", error=str(e))
+    except RateLimitError as e:
+        logfire.warn("AI rate limit exceeded", error=str(e))
         raise AIRateLimitError()
-    except (HTTPStatusError, ConnectError) as e:
+    except (APIConnectionError, ConnectError, HTTPStatusError) as e:
         logfire.error("AI provider connection error", error=str(e))
         raise AIProviderError("AI provider unavailable.")
+    except LangChainException as e:
+        logfire.error("AI model error", error=str(e))
+        raise AIProviderError()
 
 
 @router.post("/assessments", response_model=AssessmentResult, response_model_by_alias=True)
@@ -61,6 +68,27 @@ async def create_assessment(request: AssessmentRequest) -> AssessmentResult:
 
 
 MAX_DOCUMENT_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20 MB (GPT-4o Vision limit)
+
+_ALL_DOCUMENT_EXTENSIONS = SUPPORTED_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS
+
+
+async def _extract_text_from_file(filename: str, content: bytes) -> str:
+    """Extract text from any supported file, using OCR where needed."""
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if ext in SUPPORTED_IMAGE_EXTENSIONS:
+        return await ocr_image(filename, content)
+
+    if ext == ".pdf":
+        text, page_count = parse_pdf(content)
+        if is_sparse_pdf(text, page_count):
+            logfire.info("Sparse PDF detected, falling back to OCR", filename=filename, page_count=page_count)
+            text = await ocr_pdf(content)
+        return text
+
+    # txt / docx / md
+    return extract_text(filename, content)
 
 
 @router.post("/assessments/document", response_model=AssessmentResult, response_model_by_alias=True)
@@ -73,15 +101,18 @@ async def create_document_assessment(
         raise ValidationError("File must have a filename.")
 
     ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in SUPPORTED_EXTENSIONS:
-        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+    if ext not in _ALL_DOCUMENT_EXTENSIONS:
+        supported = ", ".join(sorted(_ALL_DOCUMENT_EXTENSIONS))
         raise ValidationError(f"Unsupported file format '{ext}'. Supported: {supported}.")
 
     content = await file.read()
     if len(content) == 0:
         raise ValidationError("File is empty.")
-    if len(content) > MAX_DOCUMENT_SIZE:
-        raise ValidationError("File exceeds maximum size of 10MB.")
+
+    max_size = MAX_IMAGE_SIZE if ext in SUPPORTED_IMAGE_EXTENSIONS else MAX_DOCUMENT_SIZE
+    if len(content) > max_size:
+        limit_mb = max_size // (1024 * 1024)
+        raise ValidationError(f"File exceeds maximum size of {limit_mb}MB.")
 
     try:
         scorecard_data = json.loads(scorecard)
@@ -90,14 +121,14 @@ async def create_document_assessment(
         raise ValidationError(f"Invalid scorecard JSON: {e}")
 
     try:
-        text = extract_text(file.filename, content)
+        text = await _extract_text_from_file(file.filename, content)
     except ValueError as e:
         raise ValidationError(str(e))
 
-    if len(text) < 50:
+    if len(text.strip()) < 50:
         raise ValidationError(
             f"Extracted text too short ({len(text)} chars). "
-            "The document may be empty, image-only, or unreadable."
+            "The file may be empty, purely visual with no readable text, or corrupt."
         )
 
     request = AssessmentRequest(

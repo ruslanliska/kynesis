@@ -1,11 +1,10 @@
-from unittest.mock import AsyncMock, patch
+import copy
+from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from httpx import AsyncClient
 
 from tests.conftest import TEST_API_KEY
 
-# Scorecard with 2 sections (weighted), each with 1 binary question
 SCORECARD_PAYLOAD = {
     "id": "sc-1",
     "name": "Test Scorecard",
@@ -13,7 +12,7 @@ SCORECARD_PAYLOAD = {
     "status": "active",
     "scoringMode": "add",
     "maxScore": 20,
-    "passingThreshold": 70,
+    "passingThreshold": 15,
     "allowQuestionComments": True,
     "allowOverallComment": True,
     "showPointsToEvaluator": True,
@@ -68,32 +67,22 @@ SCORECARD_PAYLOAD = {
     ],
 }
 
-VALID_CONTENT = "A" * 60  # min_length=50
-
+VALID_CONTENT = "A" * 60
 HEADERS = {"X-API-Key": TEST_API_KEY}
 
 
 def _mock_ai_output():
-    """Create a mock AI agent result with both questions answered Yes (full points)."""
     from app.assessment.services import AIQuestionOutput, AIScoreOutput
-
     return AIScoreOutput(
         content_analysis="A document with clear structure.",
         questions=[
             AIQuestionOutput(
-                question_id="q1",
-                selected_option_id="opt-q1-yes",
-                evidence=["Direct quote from content"],
-                reasoning="Evidence shows clarity.",
-                comment="Clear writing.",
-                suggestions=None,
+                question_id="q1", selected_option_id="opt-q1-yes",
+                evidence=["Direct quote"], reasoning="Clear.", comment="Clear writing.", suggestions=None,
             ),
             AIQuestionOutput(
-                question_id="q2",
-                selected_option_id="opt-q2-yes",
-                evidence=["Relevant passage found"],
-                reasoning="Accuracy confirmed.",
-                comment="Mostly accurate.",
+                question_id="q2", selected_option_id="opt-q2-yes",
+                evidence=["Relevant passage"], reasoning="Accurate.", comment="Mostly accurate.",
                 suggestions="Double check facts.",
             ),
         ],
@@ -101,23 +90,20 @@ def _mock_ai_output():
     )
 
 
-def _make_mock_agent_run(ai_output):
-    mock_result = AsyncMock()
-    mock_result.output = ai_output
-    return AsyncMock(return_value=mock_result)
+def _patch_llm(ai_output):
+    """Patch get_llm to return a mock LangChain model whose chain returns ai_output."""
+    mock_chain = MagicMock()
+    mock_chain.ainvoke = AsyncMock(return_value=ai_output)
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output = MagicMock(return_value=mock_chain)
+    return patch("app.assessment.services.get_llm", return_value=mock_llm)
 
 
 # --- POST /api/v1/assessments ---
 
 
 async def test_assessment_returns_200(async_client: AsyncClient):
-    mock_run = _make_mock_agent_run(_mock_ai_output())
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(_mock_ai_output()):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT, "contentType": "document"},
@@ -138,13 +124,7 @@ async def test_assessment_returns_200(async_client: AsyncClient):
 
 
 async def test_assessment_question_fields(async_client: AsyncClient):
-    mock_run = _make_mock_agent_run(_mock_ai_output())
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(_mock_ai_output()):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
@@ -155,7 +135,7 @@ async def test_assessment_question_fields(async_client: AsyncClient):
     q1 = next(q for q in data["questions"] if q["questionId"] == "q1")
     assert q1["score"] == 10
     assert q1["maxPoints"] == 10
-    assert q1["passed"] is True  # 10 >= 10 * 0.6
+    assert q1["passed"] is True
     assert q1["sectionId"] == "sec-1"
     assert q1["suggestions"] is None
 
@@ -166,41 +146,27 @@ async def test_assessment_question_fields(async_client: AsyncClient):
 
 
 async def test_assessment_passed_below_threshold(async_client: AsyncClient):
-    """Question scored 0 should mark passed=False."""
     from app.assessment.services import AIQuestionOutput, AIScoreOutput
 
     ai_output = AIScoreOutput(
-        content_analysis="Test content.",
+        content_analysis="Test.",
         questions=[
-            AIQuestionOutput(
-                question_id="q1", selected_option_id="opt-q1-no",
-                evidence=["Some evidence"], reasoning="Below threshold.",
-                comment="Poor.", suggestions="Improve.",
-            ),
-            AIQuestionOutput(
-                question_id="q2", selected_option_id="opt-q2-no",
-                evidence=["Some evidence"], reasoning="Below threshold.",
-                comment="Poor.", suggestions="Improve.",
-            ),
+            AIQuestionOutput(question_id="q1", selected_option_id="opt-q1-no",
+                             evidence=["e"], reasoning="r", comment="Poor.", suggestions="Improve."),
+            AIQuestionOutput(question_id="q2", selected_option_id="opt-q2-no",
+                             evidence=["e"], reasoning="r", comment="Poor.", suggestions="Improve."),
         ],
         summary="Needs work.",
     )
-    mock_run = _make_mock_agent_run(ai_output)
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(ai_output):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
             headers=HEADERS,
         )
 
-    data = response.json()
-    q1 = next(q for q in data["questions"] if q["questionId"] == "q1")
-    assert q1["passed"] is False  # 0 < 10 * 0.6
+    q1 = next(q for q in response.json()["questions"] if q["questionId"] == "q1")
+    assert q1["passed"] is False
 
 
 async def test_assessment_weighted_score_calculation(async_client: AsyncClient):
@@ -208,47 +174,27 @@ async def test_assessment_weighted_score_calculation(async_client: AsyncClient):
     from app.assessment.services import AIQuestionOutput, AIScoreOutput
 
     ai_output = AIScoreOutput(
-        content_analysis="Test content.",
+        content_analysis="Test.",
         questions=[
-            AIQuestionOutput(
-                question_id="q1", selected_option_id="opt-q1-yes",
-                evidence=["Perfect evidence"], reasoning="Fully meets criterion.",
-                comment="Perfect.", suggestions=None,
-            ),
-            AIQuestionOutput(
-                question_id="q2", selected_option_id="opt-q2-no",
-                evidence=["Partial evidence"], reasoning="Does not meet criterion.",
-                comment="Failed.", suggestions="More accuracy.",
-            ),
+            AIQuestionOutput(question_id="q1", selected_option_id="opt-q1-yes",
+                             evidence=["e"], reasoning="r", comment="Perfect.", suggestions=None),
+            AIQuestionOutput(question_id="q2", selected_option_id="opt-q2-no",
+                             evidence=["e"], reasoning="r", comment="Failed.", suggestions="More."),
         ],
         summary="Mixed.",
     )
-    mock_run = _make_mock_agent_run(ai_output)
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(ai_output):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
             headers=HEADERS,
         )
 
-    data = response.json()
-    assert data["overall"]["score"] == 50.0
+    assert response.json()["overall"]["score"] == 50.0
 
 
 async def test_assessment_overall_pass_fail(async_client: AsyncClient):
-    """overall.passed reflects passing_threshold and hard critical state."""
-    mock_run = _make_mock_agent_run(_mock_ai_output())  # both yes → score=100
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(_mock_ai_output()):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
@@ -261,8 +207,6 @@ async def test_assessment_overall_pass_fail(async_client: AsyncClient):
 
 
 async def test_assessment_hard_critical_failure(async_client: AsyncClient):
-    """Hard-critical question scored 0 → hardCriticalFailure=True and passed=False."""
-    import copy
     from app.assessment.services import AIQuestionOutput, AIScoreOutput
 
     scorecard_hard = copy.deepcopy(SCORECARD_PAYLOAD)
@@ -271,24 +215,14 @@ async def test_assessment_hard_critical_failure(async_client: AsyncClient):
     ai_output = AIScoreOutput(
         content_analysis="Test.",
         questions=[
-            AIQuestionOutput(
-                question_id="q1", selected_option_id="opt-q1-no",  # 0 pts, hard-critical
-                evidence=["Evidence"], reasoning="Failed.", comment="Failed.", suggestions=None,
-            ),
-            AIQuestionOutput(
-                question_id="q2", selected_option_id="opt-q2-yes",
-                evidence=["Evidence"], reasoning="OK.", comment="OK.", suggestions=None,
-            ),
+            AIQuestionOutput(question_id="q1", selected_option_id="opt-q1-no",
+                             evidence=["e"], reasoning="Failed.", comment="Failed.", suggestions=None),
+            AIQuestionOutput(question_id="q2", selected_option_id="opt-q2-yes",
+                             evidence=["e"], reasoning="OK.", comment="OK.", suggestions=None),
         ],
         summary="Hard critical fail.",
     )
-    mock_run = _make_mock_agent_run(ai_output)
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(ai_output):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": scorecard_hard, "content": VALID_CONTENT},
@@ -302,7 +236,6 @@ async def test_assessment_hard_critical_failure(async_client: AsyncClient):
 
 
 async def test_assessment_draft_scorecard_returns_422(async_client: AsyncClient):
-    import copy
     scorecard_draft = copy.deepcopy(SCORECARD_PAYLOAD)
     scorecard_draft["status"] = "draft"
 
@@ -350,7 +283,6 @@ async def test_assessment_returns_422_missing_scorecard(async_client: AsyncClien
 
 
 async def test_assessment_returns_422_empty_sections(async_client: AsyncClient):
-    import copy
     scorecard_empty = copy.deepcopy(SCORECARD_PAYLOAD)
     scorecard_empty["sections"] = []
 
@@ -372,14 +304,7 @@ async def test_assessment_returns_422_invalid_content_type(async_client: AsyncCl
 
 
 async def test_assessment_camel_case_response(async_client: AsyncClient):
-    """Verify response uses camelCase field names."""
-    mock_run = _make_mock_agent_run(_mock_ai_output())
-
-    with patch("app.assessment.services.get_assessment_agent") as mock_get_agent:
-        mock_agent = AsyncMock()
-        mock_agent.run = mock_run
-        mock_get_agent.return_value = mock_agent
-
+    with _patch_llm(_mock_ai_output()):
         response = await async_client.post(
             "/api/v1/assessments",
             json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
@@ -391,13 +316,9 @@ async def test_assessment_camel_case_response(async_client: AsyncClient):
     assert "scorecardVersion" in data
     assert "contentType" in data
     assert "assessedAt" in data
-    # Section result fields
     assert "sectionId" in data["sections"][0]
     assert "sectionName" in data["sections"][0]
-    # Question result fields
     assert "questionId" in data["questions"][0]
     assert "maxPoints" in data["questions"][0]
-    assert "sectionId" in data["questions"][0]
-    # Overall fields
     assert "hardCriticalFailure" in data["overall"]
     assert "passed" in data["overall"]

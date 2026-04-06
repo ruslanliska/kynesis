@@ -39,7 +39,7 @@ class AssessmentRequest(CamelModel):
     content: str = Field(min_length=50, max_length=100_000)
     content_type: ContentType = ContentType.other
     use_knowledge_base: bool = False
-    provider: AIProvider = AIProvider.openai
+    provider: AIProvider = AIProvider.deepseek
 
     @field_validator("content", mode="before")
     @classmethod
