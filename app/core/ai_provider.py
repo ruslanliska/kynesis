@@ -68,3 +68,38 @@ def get_llm(provider: str | None = None) -> ChatDeepSeek | ChatOpenAI:
     """Return the configured LLM. Pass provider to override the default."""
     p = provider or DEFAULT_LLM_PROVIDER
     return get_deepseek() if p == "deepseek" else get_openai()
+
+
+# ---------------------------------------------------------------------------
+# Two-stage reasoning pipeline factories (feature 003-reasoning-aggregation)
+# ---------------------------------------------------------------------------
+
+
+@lru_cache
+def get_reasoning_llm() -> ChatDeepSeek | ChatOpenAI:
+    """Reasoning-stage LLM. Uses settings.assessment.reasoning_model.
+
+    Defaults to DeepSeek R1 (`deepseek-reasoner`) which exposes the full thinking
+    trace via response.additional_kwargs['reasoning_content'] — required for
+    LangSmith visibility per FR-008 and US2 Acceptance Scenario 3.
+    """
+    settings = get_settings()
+    model = settings.assessment.reasoning_model
+    if model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
+        return ChatOpenAI(model=model, api_key=settings.openai.api_key)
+    return ChatDeepSeek(model=model, api_key=settings.deepseek.api_key)
+
+
+@lru_cache
+def get_structuring_llm() -> ChatDeepSeek | ChatOpenAI:
+    """Structuring-stage LLM — formatter only, low temperature per FR-013.
+
+    Temperature is pinned to settings.assessment.structuring_temperature (≤ 0.2)
+    so output is a near-deterministic transcription of the reasoner's conclusions.
+    """
+    settings = get_settings()
+    model = settings.assessment.structuring_model
+    temperature = settings.assessment.structuring_temperature
+    if model.startswith("gpt-"):
+        return ChatOpenAI(model=model, api_key=settings.openai.api_key, temperature=temperature)
+    return ChatDeepSeek(model=model, api_key=settings.deepseek.api_key, temperature=temperature)

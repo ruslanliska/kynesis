@@ -11,7 +11,7 @@ from app.assessment.schemas import (
     AssessmentResult,
     ContentType,
 )
-from app.assessment.services import run_assessment
+from app.assessment.services import run_legacy_assessment, run_reasoning_assessment
 from app.assessment.ocr import (
     SUPPORTED_IMAGE_EXTENSIONS,
     is_sparse_pdf,
@@ -24,7 +24,14 @@ from app.assessment.transcription import (
     transcribe_audio,
 )
 from app.core.auth import verify_api_key
-from app.core.errors import AIProviderError, AIRateLimitError, ValidationError
+from app.core.errors import (
+    AIProviderError,
+    AIRateLimitError,
+    PipelineTimeoutError,
+    ReasoningPayloadTooLargeError,
+    ReasoningUnavailableError,
+    ValidationError,
+)
 from app.knowledge_base.parsers import SUPPORTED_EXTENSIONS, parse_pdf, extract_text
 from app.scorecards.schemas import ScorecardDefinition, ScorecardStatus
 
@@ -50,7 +57,10 @@ async def _run_with_error_handling(
         )
 
     try:
-        return await run_assessment(request, knowledge_base_context)
+        return await run_reasoning_assessment(request, knowledge_base_context)
+    except (PipelineTimeoutError, ReasoningPayloadTooLargeError, ReasoningUnavailableError):
+        # These are already HTTPExceptions with the right status + detail — re-raise.
+        raise
     except RateLimitError as e:
         logfire.warn("AI rate limit exceeded", error=str(e))
         raise AIRateLimitError()

@@ -1,24 +1,38 @@
 from datetime import datetime, timezone
 
+import asyncio
 import json
 import logging
+import re
+import time
 
 import logfire
 from langchain_core.messages import HumanMessage, SystemMessage
+from langsmith import traceable
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 from app.assessment.schemas import (
+    AggregatedReasoning,
     AIProvider,
-    PASS_THRESHOLD,
     AssessmentRequest,
     AssessmentResult,
     OverallResult,
+    PASS_THRESHOLD,
     QuestionResult,
+    ReasoningQuestionRecord,
     SectionResult,
+    StageOutcome,
 )
-from app.core.ai_provider import get_llm
+from app.core.ai_provider import get_llm, get_reasoning_llm, get_structuring_llm
+from app.core.config import get_settings
+from app.core.errors import (
+    PipelineTimeoutError,
+    ReasoningCoverageError,
+    ReasoningPayloadTooLargeError,
+    ReasoningUnavailableError,
+)
 from app.scorecards.schemas import (
     CriticalType,
     ScorecardDefinition,
@@ -272,7 +286,7 @@ def calculate_scores(
 MAX_RETRIES = 3
 
 
-async def run_assessment(
+async def run_legacy_assessment(
     request: AssessmentRequest,
     knowledge_base_context: str | None = None,
 ) -> AssessmentResult:
@@ -357,3 +371,421 @@ async def run_assessment(
         sections=section_results,
         questions=question_results,
     )
+
+
+# ---------------------------------------------------------------------------
+# Two-stage reasoning pipeline (feature 003-reasoning-aggregation)
+# ---------------------------------------------------------------------------
+
+_REASONING_SYSTEM_PROMPT = """\
+You are a rigorous QA auditor producing a deep, evidence-grounded reasoning pass.
+
+## YOUR TASK
+Analyse the content below against EVERY question on the scorecard. Produce a thorough rationale for each question BEFORE any score is computed by the downstream formatter.
+
+## OUTPUT FORMAT — STRICT
+For every question in the scorecard, emit a block of the form:
+
+### Q: <question_id>
+<Your analysis: what the evidence says, which evidence is relevant (verbatim quotes),
+what is missing, and the answer the evidence best supports — naming the exact option_id
+or numeric value. At least 50 characters, ideally 2–6 sentences.>
+
+Use the EXACT question id from the scorecard as `<question_id>` (do not paraphrase).
+Do not merge questions. Do not add commentary outside the `### Q:` blocks.
+
+## RULES
+- Never claim something happened without verbatim evidence from the content.
+- For HARD CRITICAL questions, explicitly state whether the evidence supports awarding points.
+- Compute actual time differences when timestamps exist.
+- Score conservatively when evidence is absent or ambiguous.
+"""
+
+
+_STRUCTURING_SYSTEM_PROMPT = """\
+You are a TRANSCRIBER. Your sole job is to serialise a prior reasoning analysis into
+the structured response schema. You MUST NOT re-evaluate, second-guess, or contradict
+the reasoning.
+
+## RULES — BINDING
+1. The reasoning below is AUTHORITATIVE prior analysis. Transcribe its conclusions.
+   Do not re-evaluate, override scores, or introduce new evidence.
+2. Every `evidence` quote MUST appear verbatim in either the rationale or the source
+   content. Do not invent evidence.
+3. `selected_option_id` / `numeric_value` for each question MUST match the answer
+   indicated by the rationale for that question.
+4. `comment` MUST NOT assert facts absent from or contradicted by the rationale.
+5. Temperature is low by design; prefer the reasoner's wording over paraphrase.
+6. For HARD CRITICAL questions, preserve the reasoner's verdict exactly — a
+   hard-critical zero MUST NOT be softened.
+"""
+
+
+# Char-to-token heuristic. DeepSeek/GPT context windows are large, but we want a
+# conservative ceiling to catch pathological inputs before a network round-trip.
+# 400_000 chars ≈ 100k tokens at ~4 chars/token — well under deepseek-chat's
+# 128k input window, leaving room for system prompt + structured-output schema.
+_STRUCTURING_PROMPT_CHAR_BUDGET = 400_000
+
+
+_Q_HEADER_RE = re.compile(r"^###\s*Q:\s*(\S.*?)\s*$", re.MULTILINE)
+
+
+def _parse_reasoning_response(
+    text: str, scorecard: ScorecardDefinition
+) -> list[ReasoningQuestionRecord]:
+    """Parse `### Q: <id>` blocks from a reasoner's response.
+
+    Unknown or misformatted headers raise ValueError. Missing questions are
+    detected by the caller (coverage check).
+    """
+    expected_ids = {q.id for s in scorecard.sections for q in s.questions}
+
+    matches = list(_Q_HEADER_RE.finditer(text))
+    if not matches:
+        raise ValueError(
+            "Reasoning response contained no '### Q: <id>' blocks; cannot parse."
+        )
+
+    records: list[ReasoningQuestionRecord] = []
+    seen: set[str] = set()
+    for idx, match in enumerate(matches):
+        qid = match.group(1).strip()
+        if qid not in expected_ids:
+            raise ValueError(
+                f"Reasoning response references unknown question id: {qid!r}"
+            )
+        if qid in seen:
+            raise ValueError(
+                f"Reasoning response contains duplicate block for question id: {qid!r}"
+            )
+        seen.add(qid)
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        rationale = text[start:end].strip()
+        if not rationale:
+            records.append(
+                ReasoningQuestionRecord(question_id=qid, rationale="", status="missing")
+            )
+        else:
+            records.append(
+                ReasoningQuestionRecord(question_id=qid, rationale=rationale, status="ok")
+            )
+
+    return records
+
+
+@traceable(name="reasoning_stage", run_type="chain")
+async def reasoning_stage(
+    request: AssessmentRequest,
+    knowledge_base_context: str | None = None,
+) -> AggregatedReasoning:
+    """First stage — produce per-question rationale via the reasoning model.
+
+    On coverage failure (any scorecard question missing from the response) raises
+    ReasoningCoverageError — the orchestrator treats this as a retryable reasoning
+    failure.
+    """
+    llm = get_reasoning_llm()
+    scorecard_context = _build_scorecard_context(request.scorecard, knowledge_base_context)
+    messages = [
+        SystemMessage(content=_REASONING_SYSTEM_PROMPT + "\n\n" + scorecard_context),
+        HumanMessage(content=f"Evaluate the following content:\n\n{request.content}"),
+    ]
+
+    with logfire.span("reasoning_stage", scorecard_id=request.scorecard.id):
+        response = await llm.ainvoke(messages)
+
+    text = response.content if isinstance(response.content, str) else str(response.content)
+    thinking_trace = None
+    if hasattr(response, "additional_kwargs") and isinstance(response.additional_kwargs, dict):
+        trace = response.additional_kwargs.get("reasoning_content")
+        if isinstance(trace, str) and trace.strip():
+            thinking_trace = trace
+
+    records = _parse_reasoning_response(text, request.scorecard)
+
+    # Coverage check — must have one record per scorecard question.
+    expected_ids = {q.id for s in request.scorecard.sections for q in s.questions}
+    produced_ids = {r.question_id for r in records}
+    missing = expected_ids - produced_ids
+    if missing:
+        raise ReasoningCoverageError(missing)
+
+    # Attach thinking trace to every record (single-call reasoning per plan).
+    if thinking_trace is not None:
+        records = [
+            ReasoningQuestionRecord(
+                question_id=r.question_id,
+                rationale=r.rationale,
+                thinking_trace=thinking_trace,
+                status=r.status,
+            )
+            for r in records
+        ]
+
+    return AggregatedReasoning(
+        scorecard_id=request.scorecard.id,
+        content_type=request.content_type,
+        content_preview=request.content[:500],
+        records=records,
+        full_trace_available=all(r.status == "ok" for r in records) and thinking_trace is not None,
+    )
+
+
+def _format_reasoning_for_structuring(reasoning: AggregatedReasoning) -> str:
+    lines = ["## Prior Reasoning (authoritative — transcribe, do not re-evaluate)", ""]
+    for r in reasoning.records:
+        lines.append(f"### Q: {r.question_id}")
+        lines.append(r.rationale)
+        lines.append("")
+    return "\n".join(lines)
+
+
+@traceable(name="structuring_stage", run_type="chain")
+async def structuring_stage(
+    request: AssessmentRequest,
+    reasoning: AggregatedReasoning,
+    knowledge_base_context: str | None = None,
+) -> "AIScoreOutput":
+    """Second stage — serialise the reasoner's conclusions into AIScoreOutput.
+
+    Runs at low temperature (pinned via get_structuring_llm). Retries on
+    validation failure, reusing the same reasoning artifact across retries.
+    Raises ReasoningPayloadTooLargeError pre-emptively when the prompt size
+    exceeds the structuring model's input budget (FR-014) — no LLM call made.
+    """
+    settings = get_settings()
+    llm = get_structuring_llm()
+    chain = llm.with_structured_output(AIScoreOutput)
+
+    scorecard_context = _build_scorecard_context(request.scorecard, knowledge_base_context)
+    reasoning_block = _format_reasoning_for_structuring(reasoning)
+
+    system_prompt = (
+        _STRUCTURING_SYSTEM_PROMPT
+        + "\n\n"
+        + scorecard_context
+        + "\n\n"
+        + reasoning_block
+    )
+    user_prompt = f"Evaluate the following content:\n\n{request.content}"
+
+    # FR-014: pre-flight oversize rejection. Compare total prompt chars against
+    # the conservative budget BEFORE any network call.
+    total_chars = len(system_prompt) + len(user_prompt)
+    if total_chars > _STRUCTURING_PROMPT_CHAR_BUDGET:
+        raise ReasoningPayloadTooLargeError()
+
+    messages: list[SystemMessage | HumanMessage] = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+
+    max_attempts = settings.assessment.structuring_retries + 1
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        with logfire.span(
+            "structuring_stage", scorecard_id=request.scorecard.id, attempt=attempt + 1
+        ):
+            try:
+                ai_output = await chain.ainvoke(messages)
+                _validate_output(ai_output, request.scorecard)
+                return ai_output
+            except Exception as e:  # noqa: BLE001 — we append feedback and retry
+                last_error = e
+                logfire.warn(
+                    "Structuring attempt failed",
+                    attempt=attempt + 1,
+                    error=str(e),
+                )
+                if attempt < max_attempts - 1:
+                    messages.append(
+                        HumanMessage(
+                            content=(
+                                f"Validation error: {e}\n"
+                                "Please fix and respond again with the complete corrected output. "
+                                "Remember: transcribe the reasoning above; do not re-evaluate."
+                            )
+                        )
+                    )
+
+    # Exhausted all attempts.
+    failing_qids: list[str] = []
+    msg = str(last_error) if last_error else "unknown"
+    raise AIProviderError(
+        detail=(
+            f"Assessment could not be scored after {max_attempts} structuring attempts. "
+            f"Last error: {msg}"
+        )
+    )
+
+
+async def _run_reasoning_with_retries(
+    request: AssessmentRequest,
+    knowledge_base_context: str | None,
+) -> AggregatedReasoning:
+    """Run reasoning_stage with settings.assessment.reasoning_retries + 1 attempts."""
+    settings = get_settings()
+    max_attempts = settings.assessment.reasoning_retries + 1
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await reasoning_stage(request, knowledge_base_context)
+        except Exception as e:  # noqa: BLE001 — retried or surfaced below
+            last_error = e
+            logfire.warn(
+                "Reasoning attempt failed",
+                attempt=attempt + 1,
+                error=str(e),
+            )
+    # Reasoning exhausted — surface the last error to the orchestrator policy branch.
+    raise last_error if last_error else RuntimeError("Reasoning stage failed with no error.")
+
+
+def _compose_result(
+    request: AssessmentRequest,
+    ai_output: "AIScoreOutput",
+    reasoning: AggregatedReasoning | None,
+) -> AssessmentResult:
+    """Shared result assembly — merges AIScoreOutput + calculate_scores + rationale.
+
+    `reasoning` may be None when called from the fallback path; in that case every
+    QuestionResult.rationale defaults to "".
+    """
+    section_results, overall_score, total_earned, hard_critical_failure = calculate_scores(
+        ai_output.questions, request.scorecard
+    )
+
+    if hard_critical_failure:
+        overall_score = 0.0
+
+    if request.scorecard.passing_threshold is not None:
+        passed: bool | None = (
+            not hard_critical_failure
+            and total_earned >= request.scorecard.passing_threshold
+        )
+    else:
+        passed = None if not hard_critical_failure else False
+
+    ai_map = {q.question_id: q for q in ai_output.questions}
+    rationale_map: dict[str, str] = {}
+    if reasoning is not None:
+        rationale_map = {r.question_id: r.rationale for r in reasoning.records}
+
+    question_results: list[QuestionResult] = []
+    for section in request.scorecard.sections:
+        for question in section.questions:
+            earned = _question_earned(
+                ai_map[question.id], question, request.scorecard.scoring_mode
+            )
+            question_results.append(
+                QuestionResult(
+                    question_id=question.id,
+                    section_id=section.id,
+                    score=earned,
+                    max_points=question.max_points,
+                    passed=earned >= question.max_points * PASS_THRESHOLD,
+                    critical=question.critical,
+                    comment=ai_map[question.id].comment,
+                    suggestions=ai_map[question.id].suggestions,
+                    rationale=rationale_map.get(question.id, ""),
+                )
+            )
+
+    return AssessmentResult(
+        scorecard_id=request.scorecard.id,
+        scorecard_version=request.scorecard.version,
+        content_type=request.content_type,
+        assessed_at=datetime.now(timezone.utc),
+        overall=OverallResult(
+            score=overall_score,
+            max_score=100,
+            passed=passed,
+            hard_critical_failure=hard_critical_failure,
+            summary=ai_output.summary,
+            reasoning_unavailable=(reasoning is None),
+        ),
+        sections=section_results,
+        questions=question_results,
+    )
+
+
+@traceable(name="assessment_pipeline", run_type="chain")
+async def run_reasoning_assessment(
+    request: AssessmentRequest,
+    knowledge_base_context: str | None = None,
+) -> AssessmentResult:
+    """Two-stage orchestrator. Feature 003-reasoning-aggregation entrypoint.
+
+    Enforces the 180s outer deadline. On reasoning-stage retry exhaustion:
+      - failure_policy="fallback" → run legacy flow, label result reasoning_unavailable.
+      - failure_policy="strict"   → raise ReasoningUnavailableError.
+    """
+    settings = get_settings()
+    timeout_seconds = settings.assessment.request_timeout_seconds
+
+    async def _inner() -> AssessmentResult:
+        pipeline_start = time.monotonic()
+        with logfire.span("assessment_pipeline", scorecard_id=request.scorecard.id):
+            # --- Reasoning stage ---
+            try:
+                reasoning = await _run_reasoning_with_retries(request, knowledge_base_context)
+            except (PipelineTimeoutError, ReasoningPayloadTooLargeError):
+                raise
+            except Exception as e:  # reasoning exhausted
+                logfire.warn("Reasoning stage exhausted retries", error=str(e))
+                return await _handle_reasoning_failure(request, knowledge_base_context)
+
+            # Budget check before structuring stage.
+            elapsed = time.monotonic() - pipeline_start
+            remaining = timeout_seconds - elapsed
+            if remaining < 10:
+                raise PipelineTimeoutError(timeout_seconds)
+
+            # --- Structuring stage ---
+            ai_output = await structuring_stage(request, reasoning, knowledge_base_context)
+            return _compose_result(request, ai_output, reasoning)
+
+    try:
+        return await asyncio.wait_for(_inner(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as e:
+        raise PipelineTimeoutError(timeout_seconds) from e
+
+
+async def _handle_reasoning_failure(
+    request: AssessmentRequest,
+    knowledge_base_context: str | None,
+) -> AssessmentResult:
+    """Apply FR-010 failure policy. Either fall back or raise."""
+    settings = get_settings()
+    if settings.assessment.failure_policy == "fallback":
+        logfire.info("Falling back to legacy single-shot assessment")
+        legacy_result = await run_legacy_assessment(request, knowledge_base_context)
+        # Label the fallback result.
+        legacy_result.overall = OverallResult(
+            score=legacy_result.overall.score,
+            max_score=legacy_result.overall.max_score,
+            passed=legacy_result.overall.passed,
+            hard_critical_failure=legacy_result.overall.hard_critical_failure,
+            summary=legacy_result.overall.summary,
+            reasoning_unavailable=True,
+        )
+        # Clear rationale on the fallback result — it didn't go through reasoning.
+        legacy_result.questions = [
+            QuestionResult(
+                question_id=q.question_id,
+                section_id=q.section_id,
+                score=q.score,
+                max_points=q.max_points,
+                passed=q.passed,
+                critical=q.critical,
+                comment=q.comment,
+                suggestions=q.suggestions,
+                rationale="",
+            )
+            for q in legacy_result.questions
+        ]
+        return legacy_result
+    # strict
+    raise ReasoningUnavailableError()

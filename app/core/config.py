@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -48,6 +49,19 @@ class LangSmithConfig(BaseModel):
     endpoint: str = "https://api.smith.langchain.com"
 
 
+class AssessmentConfig(BaseModel):
+    """Two-stage reasoning pipeline configuration (feature 003-reasoning-aggregation)."""
+
+    reasoning_model: str = "deepseek-reasoner"
+    structuring_model: str = "deepseek-chat"
+    structuring_temperature: float = 0.1
+    reasoning_retries: int = 1
+    structuring_retries: int = 3
+    request_timeout_seconds: int = 180
+    structuring_reserved_seconds: int = 15
+    failure_policy: Literal["strict", "fallback"] = "fallback"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_files(),
@@ -73,6 +87,7 @@ class Settings(BaseSettings):
     pinecone: PineconeConfig = PineconeConfig()
     logfire: LogfireConfig = LogfireConfig()
     langsmith: LangSmithConfig = LangSmithConfig()
+    assessment: AssessmentConfig = AssessmentConfig()
 
 
 @lru_cache
