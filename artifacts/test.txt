@@ -1,0 +1,161 @@
+{
+  "scorecard": {
+    "id": "2d7200bb-ca66-4d6b-a00e-98be626dfb78",
+    "name": "Customer Service QA",
+    "description": "Quality assurance scorecard for customer service interactions",
+    "status": "active",
+    "scoringMode": "add",
+    "passingThreshold": 75,
+    "version": 1,
+    "sections": [
+      {
+        "id": "sec-001",
+        "name": "Opening & Greeting",
+        "description": "Evaluates the agent's initial interaction",
+        "weight": null,
+        "orderIndex": 0,
+        "questions": [
+          {
+            "id": "q-001",
+            "text": "Did the agent introduce themselves properly?",
+            "description": "Agent should state their name and company",
+            "scoringType": "binary",
+            "maxPoints": 10,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 0,
+            "options": [
+              { "id": "o-001", "label": "Yes", "value": 1, "pointsChange": 10, "orderIndex": 0 },
+              { "id": "o-002", "label": "No", "value": 0, "pointsChange": 0, "orderIndex": 1 }
+            ]
+          },
+          {
+            "id": "q-002",
+            "text": "Did the agent verify the customer's identity?",
+            "description": "Agent should confirm account number or personal details",
+            "scoringType": "binary",
+            "maxPoints": 10,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 1,
+            "options": [
+              { "id": "o-003", "label": "Yes", "value": 1, "pointsChange": 10, "orderIndex": 0 },
+              { "id": "o-004", "label": "No", "value": 0, "pointsChange": 0, "orderIndex": 1 }
+            ]
+          },
+          {
+            "id": "q-003",
+            "text": "Did the agent acknowledge the customer's issue with empathy?",
+            "description": "Agent should express understanding and apologize for inconvenience",
+            "scoringType": "scale",
+            "maxPoints": 15,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 2,
+            "options": [
+              { "id": "o-005", "label": "Excellent", "value": 3, "pointsChange": 15, "orderIndex": 0 },
+              { "id": "o-006", "label": "Good", "value": 2, "pointsChange": 10, "orderIndex": 1 },
+              { "id": "o-007", "label": "Adequate", "value": 1, "pointsChange": 5, "orderIndex": 2 },
+              { "id": "o-008", "label": "Poor", "value": 0, "pointsChange": 0, "orderIndex": 3 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sec-002",
+        "name": "Problem Resolution",
+        "description": "Evaluates the agent's troubleshooting and resolution skills",
+        "weight": null,
+        "orderIndex": 1,
+        "questions": [
+          {
+            "id": "q-004",
+            "text": "Did the agent correctly diagnose the issue?",
+            "description": "Agent should identify the root cause accurately",
+            "scoringType": "binary",
+            "maxPoints": 15,
+            "required": true,
+            "critical": "hard",
+            "orderIndex": 0,
+            "options": [
+              { "id": "o-009", "label": "Yes", "value": 1, "pointsChange": 15, "orderIndex": 0 },
+              { "id": "o-010", "label": "No", "value": 0, "pointsChange": 0, "orderIndex": 1 }
+            ]
+          },
+          {
+            "id": "q-005",
+            "text": "Did the agent provide clear step-by-step guidance?",
+            "description": "Instructions should be easy to follow and well-paced",
+            "scoringType": "scale",
+            "maxPoints": 20,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 1,
+            "options": [
+              { "id": "o-011", "label": "Excellent", "value": 3, "pointsChange": 20, "orderIndex": 0 },
+              { "id": "o-012", "label": "Good", "value": 2, "pointsChange": 14, "orderIndex": 1 },
+              { "id": "o-013", "label": "Adequate", "value": 1, "pointsChange": 7, "orderIndex": 2 },
+              { "id": "o-014", "label": "Poor", "value": 0, "pointsChange": 0, "orderIndex": 3 }
+            ]
+          },
+          {
+            "id": "q-006",
+            "text": "Did the agent offer proactive follow-up?",
+            "description": "Agent should set up monitoring or schedule a callback",
+            "scoringType": "binary",
+            "maxPoints": 10,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 2,
+            "options": [
+              { "id": "o-015", "label": "Yes", "value": 1, "pointsChange": 10, "orderIndex": 0 },
+              { "id": "o-016", "label": "No", "value": 0, "pointsChange": 0, "orderIndex": 1 }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sec-003",
+        "name": "Closing & Professionalism",
+        "description": "Evaluates the agent's closing and overall demeanor",
+        "weight": null,
+        "orderIndex": 2,
+        "questions": [
+          {
+            "id": "q-007",
+            "text": "Did the agent summarize actions taken?",
+            "description": "Agent should recap what was done and next steps",
+            "scoringType": "binary",
+            "maxPoints": 10,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 0,
+            "options": [
+              { "id": "o-017", "label": "Yes", "value": 1, "pointsChange": 10, "orderIndex": 0 },
+              { "id": "o-018", "label": "No", "value": 0, "pointsChange": 0, "orderIndex": 1 }
+            ]
+          },
+          {
+            "id": "q-008",
+            "text": "Overall communication and professionalism",
+            "description": "Tone, clarity, patience, and courtesy throughout the call",
+            "scoringType": "scale",
+            "maxPoints": 10,
+            "required": true,
+            "critical": "none",
+            "orderIndex": 1,
+            "options": [
+              { "id": "o-019", "label": "Excellent", "value": 3, "pointsChange": 10, "orderIndex": 0 },
+              { "id": "o-020", "label": "Good", "value": 2, "pointsChange": 7, "orderIndex": 1 },
+              { "id": "o-021", "label": "Adequate", "value": 1, "pointsChange": 4, "orderIndex": 2 },
+              { "id": "o-022", "label": "Poor", "value": 0, "pointsChange": 0, "orderIndex": 3 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "content": "<the transcript text>",
+  "contentType": "call_transcript",
+  "useKnowledgeBase": false
+}

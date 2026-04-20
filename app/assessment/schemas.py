@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -70,6 +70,9 @@ class QuestionResult(CamelModel):
     critical: CriticalType
     comment: str
     suggestions: str | None = None
+    # Feature 003: per-question rationale from the reasoning stage.
+    # Empty string when the fallback path produced the result.
+    rationale: str = Field(default="")
 
 
 class SectionResult(CamelModel):
@@ -85,6 +88,9 @@ class OverallResult(CamelModel):
     passed: bool | None = None
     hard_critical_failure: bool = False
     summary: str
+    # Feature 003: true when the two-stage flow fell back to the legacy single-shot
+    # implementation (reasoning stage unavailable / exhausted retries).
+    reasoning_unavailable: bool = Field(default=False)
 
 
 class AssessmentResult(CamelModel):
@@ -95,3 +101,44 @@ class AssessmentResult(CamelModel):
     overall: OverallResult
     sections: list[SectionResult]
     questions: list[QuestionResult]
+
+
+# ---------------------------------------------------------------------------
+# Internal schemas — feature 003-reasoning-aggregation
+# Produced in-memory during a request; NOT returned to clients, NOT persisted.
+# ---------------------------------------------------------------------------
+
+
+class ReasoningQuestionRecord(BaseModel):
+    """Per-question output from the reasoning stage.
+
+    See specs/003-reasoning-aggregation/data-model.md.
+    """
+
+    question_id: str
+    rationale: str
+    thinking_trace: str | None = None
+    status: Literal["ok", "degraded", "missing"] = "ok"
+
+
+class AggregatedReasoning(BaseModel):
+    """Complete reasoning bundle passed from reasoning_stage → structuring_stage."""
+
+    scorecard_id: str
+    content_type: ContentType
+    content_preview: str
+    records: list[ReasoningQuestionRecord]
+    full_trace_available: bool = False
+
+
+class StageOutcome(BaseModel):
+    """Observability-facing record attached as a Logfire span attribute.
+
+    Not returned to the caller.
+    """
+
+    stage: Literal["reasoning", "structuring", "fallback"]
+    status: Literal["ok", "retry_exhausted", "timeout", "validation_failed"]
+    attempts: int
+    duration_ms: int
+    error: str | None = None
