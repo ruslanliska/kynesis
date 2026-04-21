@@ -11,7 +11,7 @@ from app.assessment.schemas import (
 from app.assessment.services import (
     AIQuestionOutput,
     AIScoreOutput,
-    _parse_reasoning_response,
+    parse_reasoning_response,
     calculate_scores,
     reasoning_stage,
     run_reasoning_assessment,
@@ -745,7 +745,7 @@ def test_reasoning_response_parser_extracts_one_record_per_question():
         "### Q: q2\n"
         "Rationale for q2."
     )
-    records = _parse_reasoning_response(text, sc)
+    records = parse_reasoning_response(text, sc)
     assert [r.question_id for r in records] == ["q1", "q2"]
     assert "Rationale for q1 goes here" in records[0].rationale
     assert records[0].rationale.strip().endswith("More analysis.")
@@ -756,14 +756,14 @@ def test_reasoning_response_parser_raises_on_unknown_question_id():
     sc = _two_question_scorecard()
     text = "### Q: unknown_id\nRationale."
     with pytest.raises(ValueError, match="unknown question id"):
-        _parse_reasoning_response(text, sc)
+        parse_reasoning_response(text, sc)
 
 
 def test_reasoning_response_parser_raises_on_missing_headers():
     sc = _two_question_scorecard()
     text = "Just a narrative with no headers at all."
     with pytest.raises(ValueError, match="no '### Q:"):
-        _parse_reasoning_response(text, sc)
+        parse_reasoning_response(text, sc)
 
 
 # --- T052 Oversize reasoning payload rejected ---
@@ -798,3 +798,274 @@ async def test_oversize_reasoning_payload_rejected(monkeypatch):
 
     # Pre-flight rejection — structuring LLM was NEVER called.
     structuring_llm.with_structured_output.return_value.ainvoke.assert_not_called()
+
+
+# ============================================================================
+# Feature 004-image-assessment — vision pipeline unit tests (T007–T011)
+# ============================================================================
+
+
+def _image_scorecard() -> ScorecardDefinition:
+    """Two-question scorecard used across image-pipeline tests."""
+    return _scorecard([
+        ("s1", 100.0, [_binary_question("q1", 10), _binary_question("q2", 10)]),
+    ], max_score=20)
+
+
+def _image_ai_output() -> AIScoreOutput:
+    return AIScoreOutput(
+        content_analysis="A screenshot of a chat conversation.",
+        questions=[
+            AIQuestionOutput(
+                question_id="q1",
+                selected_option_id="q1-yes",
+                evidence=["Greeting visible in first message"],
+                reasoning="Clear greeting.",
+                comment="Image shows a proper greeting.",
+                suggestions=None,
+            ),
+            AIQuestionOutput(
+                question_id="q2",
+                selected_option_id="q2-yes",
+                evidence=["Resolution visible in last message"],
+                reasoning="Issue resolved.",
+                comment="Closure is clear.",
+                suggestions=None,
+            ),
+        ],
+        summary="Good image overall.",
+    )
+
+
+def _image_reasoning_text(ai_output: AIScoreOutput) -> str:
+    blocks: list[str] = []
+    for q in ai_output.questions:
+        blocks.append(
+            f"### Q: {q.question_id}\n"
+            f"Reasoning for {q.question_id}: {q.reasoning}. "
+            f"Evidence: {q.evidence}. "
+            f"Conclusion: select option {q.selected_option_id}."
+        )
+    return "\n\n".join(blocks)
+
+
+def _mock_vision_llm(text: str) -> MagicMock:
+    response = MagicMock()
+    response.content = text
+    response.additional_kwargs = {}
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(return_value=response)
+    return llm
+
+
+# --- T007 vision_reasoning_stage happy path ---
+
+
+async def test_vision_reasoning_stage_happy_path():
+    from app.assessment.image import vision_reasoning_stage
+
+    sc = _image_scorecard()
+    ai_output = _image_ai_output()
+    vision_llm = _mock_vision_llm(_image_reasoning_text(ai_output))
+
+    with patch("app.assessment.image.get_vision_reasoning_llm", return_value=vision_llm):
+        reasoning = await vision_reasoning_stage(
+            sc, b"\x89PNG fake bytes", "screenshot.png", "image/png"
+        )
+
+    assert reasoning.scorecard_id == sc.id
+    assert reasoning.content_type == ContentType.image
+    assert "[image:" in reasoning.content_preview
+    assert "screenshot.png" in reasoning.content_preview
+    assert len(reasoning.records) == 2
+    assert {r.question_id for r in reasoning.records} == {"q1", "q2"}
+    for r in reasoning.records:
+        assert r.status == "ok"
+        assert r.rationale.strip() != ""
+
+    # Crucial: the image-bearing ainvoke was called with config={"callbacks": []}.
+    assert vision_llm.ainvoke.await_count == 1
+    call_kwargs = vision_llm.ainvoke.call_args.kwargs
+    assert call_kwargs.get("config") == {"callbacks": []}
+
+
+# --- T008 run_image_assessment happy path ---
+
+
+async def test_run_image_assessment_happy_path():
+    from app.assessment.services import run_image_assessment
+
+    sc = _image_scorecard()
+    ai_output = _image_ai_output()
+    vision_llm = _mock_vision_llm(_image_reasoning_text(ai_output))
+
+    structuring_chain = MagicMock()
+    structuring_chain.ainvoke = AsyncMock(return_value=ai_output)
+    structuring_llm = MagicMock()
+    structuring_llm.with_structured_output = MagicMock(return_value=structuring_chain)
+
+    with (
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=vision_llm),
+        patch("app.assessment.services.get_structuring_llm", return_value=structuring_llm),
+    ):
+        result = await run_image_assessment(
+            sc, b"\x89PNG fake bytes", "screenshot.png", "image/png", use_knowledge_base=False
+        )
+
+    assert result.content_type == ContentType.image
+    assert result.overall.reasoning_unavailable is False
+    assert 0.0 <= result.overall.score <= 100.0
+    assert len(result.questions) == 2
+    for q in result.questions:
+        assert q.rationale.strip() != ""
+
+
+# --- T009 run_image_assessment timeout ---
+
+
+async def test_run_image_assessment_timeout():
+    from app.assessment.services import run_image_assessment
+    from app.core.config import (
+        AssessmentConfig, LangSmithConfig, LogfireConfig,
+        OpenAIConfig, PineconeConfig, Settings,
+    )
+
+    sc = _image_scorecard()
+
+    async def slow_ainvoke(*args, **kwargs):
+        import asyncio
+        await asyncio.sleep(3)
+        response = MagicMock()
+        response.content = "### Q: q1\nIgnored — we timed out first."
+        response.additional_kwargs = {}
+        return response
+
+    slow_llm = MagicMock()
+    slow_llm.ainvoke = slow_ainvoke
+
+    short_settings = Settings(
+        API_KEY="x",
+        SUPABASE_JWT_SECRET="x",
+        DATABASE_URL="postgresql+asyncpg://x:x@localhost/x",
+        ALLOWED_ORIGINS=["http://localhost"],
+        openai=OpenAIConfig(api_key="x"),
+        pinecone=PineconeConfig(api_key="x", index_name="x"),
+        logfire=LogfireConfig(token="", send_to_logfire=False),
+        langsmith=LangSmithConfig(api_key="", project="x", tracing=False),
+        assessment=AssessmentConfig(request_timeout_seconds=1),
+    )
+
+    with (
+        patch("app.assessment.services.get_settings", return_value=short_settings),
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=slow_llm),
+        pytest.raises(PipelineTimeoutError),
+    ):
+        await run_image_assessment(
+            sc, b"\x89PNG fake", "x.png", "image/png", use_knowledge_base=False
+        )
+
+
+# --- T010 run_image_assessment vision retry exhaustion ---
+
+
+async def test_run_image_assessment_vision_retry_exhaustion_fallback():
+    """fallback policy → AIProviderError (502), NOT silent OCR fallback."""
+    from app.assessment.services import run_image_assessment
+    from app.core.errors import AIProviderError
+
+    sc = _image_scorecard()
+
+    boom_llm = MagicMock()
+    boom_llm.ainvoke = AsyncMock(side_effect=RuntimeError("vision boom"))
+
+    with (
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=boom_llm),
+        pytest.raises(AIProviderError) as exc,
+    ):
+        await run_image_assessment(
+            sc, b"\x89PNG fake", "x.png", "image/png", use_knowledge_base=False
+        )
+    assert exc.value.status_code == 502
+
+
+async def test_run_image_assessment_vision_retry_exhaustion_strict():
+    """strict policy → ReasoningUnavailableError."""
+    from app.assessment.services import run_image_assessment
+    from app.core.config import (
+        AssessmentConfig, LangSmithConfig, LogfireConfig,
+        OpenAIConfig, PineconeConfig, Settings,
+    )
+
+    sc = _image_scorecard()
+
+    boom_llm = MagicMock()
+    boom_llm.ainvoke = AsyncMock(side_effect=RuntimeError("vision boom"))
+
+    strict_settings = Settings(
+        API_KEY="x",
+        SUPABASE_JWT_SECRET="x",
+        DATABASE_URL="postgresql+asyncpg://x:x@localhost/x",
+        ALLOWED_ORIGINS=["http://localhost"],
+        openai=OpenAIConfig(api_key="x"),
+        pinecone=PineconeConfig(api_key="x", index_name="x"),
+        logfire=LogfireConfig(token="", send_to_logfire=False),
+        langsmith=LangSmithConfig(api_key="", project="x", tracing=False),
+        assessment=AssessmentConfig(failure_policy="strict"),
+    )
+
+    with (
+        patch("app.assessment.services.get_settings", return_value=strict_settings),
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=boom_llm),
+        pytest.raises(ReasoningUnavailableError),
+    ):
+        await run_image_assessment(
+            sc, b"\x89PNG fake", "x.png", "image/png", use_knowledge_base=False
+        )
+
+
+# --- T011 run_image_assessment with knowledge base ---
+
+
+async def test_run_image_assessment_with_knowledge_base():
+    from app.assessment.services import run_image_assessment
+
+    sc = _image_scorecard()
+    ai_output = _image_ai_output()
+    vision_llm = _mock_vision_llm(_image_reasoning_text(ai_output))
+
+    # Describe-for-KB LLM: returns a text description.
+    describe_response = MagicMock()
+    describe_response.content = "A screenshot showing a customer chat."
+    describe_response.additional_kwargs = {}
+    describe_llm = MagicMock()
+    describe_llm.ainvoke = AsyncMock(return_value=describe_response)
+
+    structuring_chain = MagicMock()
+    structuring_chain.ainvoke = AsyncMock(return_value=ai_output)
+    structuring_llm = MagicMock()
+    structuring_llm.with_structured_output = MagicMock(return_value=structuring_chain)
+
+    rag_mock = AsyncMock(return_value="## KB snippet\nContext from KB.\n")
+
+    with (
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=vision_llm),
+        patch("app.assessment.image.get_image_kb_describe_llm", return_value=describe_llm),
+        patch("app.assessment.services.get_structuring_llm", return_value=structuring_llm),
+        patch("app.knowledge_base.services.get_rag_context", rag_mock),
+    ):
+        result = await run_image_assessment(
+            sc, b"\x89PNG fake", "x.png", "image/png", use_knowledge_base=True
+        )
+
+    assert result.content_type == ContentType.image
+    # KB describe + reasoning call both used config={"callbacks": []}.
+    for call in describe_llm.ainvoke.await_args_list + vision_llm.ainvoke.await_args_list:
+        assert call.kwargs.get("config") == {"callbacks": []}
+    # RAG was queried once with the description text.
+    rag_mock.assert_awaited_once()
+    rag_args = rag_mock.await_args.args
+    assert rag_args[0] == sc.id
+    assert "screenshot" in rag_args[1].lower()
+    # The vision-reasoning prompt received the KB context (structural assertion).
+    system_msg_arg = vision_llm.ainvoke.await_args.args[0][0]
+    assert "Context from KB" in system_msg_arg.content

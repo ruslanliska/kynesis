@@ -18,6 +18,7 @@ from app.assessment.schemas import (
     AIProvider,
     AssessmentRequest,
     AssessmentResult,
+    ContentType,
     OverallResult,
     PASS_THRESHOLD,
     QuestionResult,
@@ -431,7 +432,7 @@ _STRUCTURING_PROMPT_CHAR_BUDGET = 400_000
 _Q_HEADER_RE = re.compile(r"^###\s*Q:\s*(\S.*?)\s*$", re.MULTILINE)
 
 
-def _parse_reasoning_response(
+def parse_reasoning_response(
     text: str, scorecard: ScorecardDefinition
 ) -> list[ReasoningQuestionRecord]:
     """Parse `### Q: <id>` blocks from a reasoner's response.
@@ -503,7 +504,7 @@ async def reasoning_stage(
         if isinstance(trace, str) and trace.strip():
             thinking_trace = trace
 
-    records = _parse_reasoning_response(text, request.scorecard)
+    records = parse_reasoning_response(text, request.scorecard)
 
     # Coverage check — must have one record per scorecard question.
     expected_ids = {q.id for s in request.scorecard.sections for q in s.questions}
@@ -789,3 +790,151 @@ async def _handle_reasoning_failure(
         return legacy_result
     # strict
     raise ReasoningUnavailableError()
+
+
+# ---------------------------------------------------------------------------
+# Image-assessment orchestrator (feature 004-image-assessment)
+# ---------------------------------------------------------------------------
+
+
+async def _run_vision_reasoning_with_retries(
+    scorecard: ScorecardDefinition,
+    image_bytes: bytes,
+    filename: str,
+    mime: str,
+    knowledge_base_context: str | None,
+) -> AggregatedReasoning:
+    from app.assessment.image import vision_reasoning_stage
+
+    settings = get_settings()
+    max_attempts = settings.assessment.reasoning_retries + 1
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await vision_reasoning_stage(
+                scorecard, image_bytes, filename, mime, knowledge_base_context
+            )
+        except Exception as e:  # noqa: BLE001 — retried or surfaced below
+            last_error = e
+            logfire.warn(
+                "Vision reasoning attempt failed",
+                attempt=attempt + 1,
+                error=str(e),
+            )
+    raise last_error if last_error else RuntimeError("Vision reasoning failed with no error.")
+
+
+_IMAGE_CONTENT_PLACEHOLDER_TEMPLATE = (
+    "[Image input — see vision-stage rationale for analysis. "
+    "filename={filename}, size={size}B]"
+)
+
+
+@traceable(name="image_assessment", run_type="chain")
+async def run_image_assessment(
+    scorecard: ScorecardDefinition,
+    image_bytes: bytes,
+    filename: str,
+    mime: str,
+    use_knowledge_base: bool = False,
+) -> AssessmentResult:
+    """Feature 004 orchestrator — vision-based image assessment.
+
+    Reuses the feature-003 structuring stage and result composition, with
+    ``vision_reasoning_stage`` replacing the text reasoning stage. The overall
+    wall-clock budget and fallback policy match ``run_reasoning_assessment``.
+    """
+    from app.assessment.image import image_describe_for_kb
+
+    settings = get_settings()
+    timeout_seconds = settings.assessment.request_timeout_seconds
+
+    # Top-level Logfire span per data-model §6. Metadata only — no image bytes.
+    with logfire.span(
+        "image_assessment",
+        scorecard_id=scorecard.id,
+        filename=filename,
+        mime=mime,
+        size_bytes=len(image_bytes),
+        use_knowledge_base=use_knowledge_base,
+    ) as span:
+
+        async def _inner() -> AssessmentResult:
+            pipeline_start = time.monotonic()
+
+            # --- Optional KB retrieval: describe-then-query ---
+            knowledge_base_context: str | None = None
+            kb_hit = False
+            if use_knowledge_base:
+                try:
+                    description = await image_describe_for_kb(image_bytes, filename, mime)
+                    from app.knowledge_base.services import get_rag_context
+
+                    knowledge_base_context = await get_rag_context(scorecard.id, description)
+                    kb_hit = bool(knowledge_base_context)
+                except Exception as e:  # noqa: BLE001 — KB failure is non-fatal
+                    logfire.warn("Knowledge base retrieval failed for image", error=str(e))
+                    knowledge_base_context = None
+            try:
+                span.set_attribute("knowledge_base_hit", kb_hit)
+            except Exception:  # pragma: no cover — span API differences
+                pass
+
+            # --- Build request artefact for reuse of structuring_stage ---
+            # See data-model.md §5 — the ``content`` placeholder exists solely
+            # to satisfy the ≥50-char Pydantic validator on AssessmentRequest.
+            # It is never sent to the vision model and is not surfaced to users.
+            placeholder = _IMAGE_CONTENT_PLACEHOLDER_TEMPLATE.format(
+                filename=filename, size=len(image_bytes)
+            )
+            if len(placeholder) < 50:
+                placeholder = placeholder.ljust(50, ".")
+            request = AssessmentRequest(
+                scorecard=scorecard,
+                content=placeholder,
+                content_type=ContentType.image,
+                use_knowledge_base=use_knowledge_base,
+            )
+
+            # --- Vision reasoning stage ---
+            try:
+                reasoning = await _run_vision_reasoning_with_retries(
+                    scorecard, image_bytes, filename, mime, knowledge_base_context
+                )
+            except (PipelineTimeoutError, ReasoningPayloadTooLargeError):
+                raise
+            except Exception as e:  # reasoning exhausted
+                logfire.warn("Vision reasoning stage exhausted retries", error=str(e))
+                if settings.assessment.failure_policy == "strict":
+                    raise ReasoningUnavailableError()
+                # Fallback (image path does NOT silently downgrade to OCR —
+                # see research R9). Surface as AIProviderError (502) because
+                # the failure is upstream.
+                from app.core.errors import AIProviderError
+
+                raise AIProviderError(
+                    detail=(
+                        "Image could not be evaluated reliably. "
+                        "Please retry or use a different image."
+                    )
+                )
+
+            # Budget check before structuring stage.
+            elapsed = time.monotonic() - pipeline_start
+            remaining = timeout_seconds - elapsed
+            if remaining < 10:
+                raise PipelineTimeoutError(timeout_seconds)
+
+            # --- Structuring stage (reused unchanged) ---
+            ai_output = await structuring_stage(request, reasoning, knowledge_base_context)
+            return _compose_result(request, ai_output, reasoning)
+
+        try:
+            result = await asyncio.wait_for(_inner(), timeout=timeout_seconds)
+            try:
+                span.set_attribute("outcome", "ok")
+            except Exception:  # pragma: no cover
+                pass
+            return result
+        except asyncio.TimeoutError as e:
+            raise PipelineTimeoutError(timeout_seconds) from e

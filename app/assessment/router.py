@@ -1,7 +1,7 @@
 import json
 
 import logfire
-from fastapi import APIRouter, Depends, Form, UploadFile
+from fastapi import APIRouter, Depends, Form, Request, UploadFile
 from httpx import ConnectError, HTTPStatusError
 from langchain_core.exceptions import LangChainException
 from openai import APIConnectionError, RateLimitError
@@ -11,9 +11,13 @@ from app.assessment.schemas import (
     AssessmentResult,
     ContentType,
 )
-from app.assessment.services import run_legacy_assessment, run_reasoning_assessment
+from app.assessment.services import (
+    run_image_assessment,
+    run_legacy_assessment,
+    run_reasoning_assessment,
+)
+from app.assessment.image import MAX_IMAGE_SIZE, SUPPORTED_IMAGE_EXTENSIONS, resolve_mime
 from app.assessment.ocr import (
-    SUPPORTED_IMAGE_EXTENSIONS,
     is_sparse_pdf,
     ocr_image,
     ocr_pdf,
@@ -78,7 +82,6 @@ async def create_assessment(request: AssessmentRequest) -> AssessmentResult:
 
 
 MAX_DOCUMENT_SIZE = 10 * 1024 * 1024  # 10 MB
-MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20 MB (GPT-4o Vision limit)
 
 _ALL_DOCUMENT_EXTENSIONS = SUPPORTED_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS
 
@@ -198,3 +201,78 @@ async def create_audio_assessment(
     )
 
     return await _run_with_error_handling(request)
+
+
+@router.post("/assessments/image", response_model=AssessmentResult, response_model_by_alias=True)
+async def create_image_assessment(
+    request: Request,
+    file: UploadFile,
+    scorecard: str = Form(...),
+    use_knowledge_base: bool = Form(False),
+) -> AssessmentResult:
+    """Feature 004 — vision-based image assessment.
+
+    Auth is inherited from the router-level ``verify_api_key`` dependency. The
+    top-level ``image_assessment`` Logfire span lives inside
+    ``run_image_assessment``, not here.
+    """
+    # --- Pre-AI validation (US2) ---
+    # FR-012: exactly one image per request. FastAPI's UploadFile signature
+    # silently takes the last file when duplicates are present, so inspect the
+    # raw multipart form to count entries under the "file" key.
+    form = await request.form()
+    file_entries = form.getlist("file")
+    if len(file_entries) > 1:
+        raise ValidationError("Only one image file is allowed per request.")
+
+    if not file.filename:
+        raise ValidationError("File must have a filename.")
+
+    ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in SUPPORTED_IMAGE_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_EXTENSIONS))
+        raise ValidationError(f"Unsupported file format '{ext}'. Supported: {supported}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise ValidationError("File is empty.")
+
+    if len(content) > MAX_IMAGE_SIZE:
+        limit_mb = MAX_IMAGE_SIZE // (1024 * 1024)
+        raise ValidationError(f"File exceeds maximum size of {limit_mb}MB.")
+
+    try:
+        scorecard_data = json.loads(scorecard)
+        scorecard_obj = ScorecardDefinition.model_validate(scorecard_data)
+    except (json.JSONDecodeError, Exception) as e:
+        raise ValidationError(f"Invalid scorecard JSON: {e}")
+
+    # Scorecard-state validation (spec US1 acceptance scenario 6).
+    if scorecard_obj.status != ScorecardStatus.active:
+        raise ValidationError(
+            f"Only active scorecards can be used for assessments. "
+            f"Current status: {scorecard_obj.status.value!r}."
+        )
+
+    mime = resolve_mime(file.filename)
+
+    # --- Run vision-based assessment ---
+    try:
+        return await run_image_assessment(
+            scorecard=scorecard_obj,
+            image_bytes=content,
+            filename=file.filename,
+            mime=mime,
+            use_knowledge_base=use_knowledge_base,
+        )
+    except (PipelineTimeoutError, ReasoningPayloadTooLargeError, ReasoningUnavailableError):
+        raise
+    except RateLimitError as e:
+        logfire.warn("AI rate limit exceeded", error=str(e))
+        raise AIRateLimitError()
+    except (APIConnectionError, ConnectError, HTTPStatusError) as e:
+        logfire.error("AI provider connection error", error=str(e))
+        raise AIProviderError("AI provider unavailable.")
+    except LangChainException as e:
+        logfire.error("AI model error", error=str(e))
+        raise AIProviderError()

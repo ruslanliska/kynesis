@@ -91,6 +91,35 @@ def get_reasoning_llm() -> ChatDeepSeek | ChatOpenAI:
 
 
 @lru_cache
+def get_vision_reasoning_llm() -> ChatOpenAI:
+    """Feature 004 — vision-capable LLM for image-assessment reasoning.
+
+    Must be OpenAI (or another vision-capable provider) because DeepSeek does
+    not accept image inputs. Image-bearing LLM calls made through this client
+    MUST pass ``config={"callbacks": []}`` at invocation time to suppress
+    LangSmith capture of the image payload (see research R6).
+    """
+    settings = get_settings()
+    return ChatOpenAI(
+        model=settings.assessment.vision_reasoning_model,
+        api_key=settings.openai.api_key,
+    )
+
+
+@lru_cache
+def get_image_kb_describe_llm() -> ChatOpenAI:
+    """Feature 004 — cheaper vision model used to describe an image prior to
+    Pinecone retrieval when ``use_knowledge_base=true``. Image-bearing calls
+    MUST pass ``config={"callbacks": []}`` at invocation time (research R6).
+    """
+    settings = get_settings()
+    return ChatOpenAI(
+        model=settings.assessment.image_kb_describe_model,
+        api_key=settings.openai.api_key,
+    )
+
+
+@lru_cache
 def get_structuring_llm() -> ChatDeepSeek | ChatOpenAI:
     """Structuring-stage LLM — formatter only, low temperature per FR-013.
 

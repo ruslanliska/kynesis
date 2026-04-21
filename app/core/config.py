@@ -60,6 +60,9 @@ class AssessmentConfig(BaseModel):
     request_timeout_seconds: int = 180
     structuring_reserved_seconds: int = 15
     failure_policy: Literal["strict", "fallback"] = "fallback"
+    # Feature 004: vision-capable models for POST /api/v1/assessments/image.
+    vision_reasoning_model: str = "gpt-4o"
+    image_kb_describe_model: str = "gpt-4o-mini"
 
 
 class Settings(BaseSettings):
