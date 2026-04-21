@@ -382,7 +382,11 @@ async def test_assessment_response_includes_rationale(async_client: AsyncClient)
     with _patch_llm(_mock_ai_output(), thinking_trace="internal thinking"):
         response = await async_client.post(
             "/api/v1/assessments",
-            json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
+            json={
+                "scorecard": SCORECARD_PAYLOAD,
+                "content": VALID_CONTENT,
+                "assessmentType": "reasoning",
+            },
             headers=HEADERS,
         )
 
@@ -421,7 +425,11 @@ async def test_assessment_fallback_labelled_on_reasoning_failure(async_client: A
     ):
         response = await async_client.post(
             "/api/v1/assessments",
-            json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
+            json={
+                "scorecard": SCORECARD_PAYLOAD,
+                "content": VALID_CONTENT,
+                "assessmentType": "reasoning",
+            },
             headers=HEADERS,
         )
 
@@ -462,7 +470,11 @@ async def test_assessment_strict_policy_returns_502(async_client: AsyncClient):
     ):
         response = await async_client.post(
             "/api/v1/assessments",
-            json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
+            json={
+                "scorecard": SCORECARD_PAYLOAD,
+                "content": VALID_CONTENT,
+                "assessmentType": "reasoning",
+            },
             headers=HEADERS,
         )
 
@@ -508,7 +520,11 @@ async def test_assessment_timeout_returns_504(async_client: AsyncClient):
     ):
         response = await async_client.post(
             "/api/v1/assessments",
-            json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
+            json={
+                "scorecard": SCORECARD_PAYLOAD,
+                "content": VALID_CONTENT,
+                "assessmentType": "reasoning",
+            },
             headers=HEADERS,
         )
 
@@ -529,7 +545,11 @@ async def test_assessment_oversize_reasoning_returns_413(async_client: AsyncClie
     ):
         response = await async_client.post(
             "/api/v1/assessments",
-            json={"scorecard": SCORECARD_PAYLOAD, "content": VALID_CONTENT},
+            json={
+                "scorecard": SCORECARD_PAYLOAD,
+                "content": VALID_CONTENT,
+                "assessmentType": "reasoning",
+            },
             headers=HEADERS,
         )
 
@@ -615,6 +635,7 @@ async def test_assessments_document_endpoint_two_stage_success(async_client: Asy
             data={
                 "scorecard": _json.dumps(SCORECARD_PAYLOAD),
                 "use_knowledge_base": "false",
+                "assessmentType": "reasoning",
             },
             headers=HEADERS,
         )
@@ -646,6 +667,7 @@ async def test_assessments_audio_endpoint_two_stage_success(async_client: AsyncC
             data={
                 "scorecard": _json.dumps(SCORECARD_PAYLOAD),
                 "use_knowledge_base": "false",
+                "assessmentType": "reasoning",
             },
             headers=HEADERS,
         )
@@ -720,6 +742,11 @@ def _patch_image_pipeline(ai_output):
     vision_response.additional_kwargs = {}
     vision_llm = MagicMock()
     vision_llm.ainvoke = AsyncMock(return_value=vision_response)
+    # Also cover the single-shot path (assessmentType=standard on /image), which
+    # calls vision_llm.with_structured_output(...).ainvoke(...) -> ai_output.
+    vision_single_shot_chain = MagicMock()
+    vision_single_shot_chain.ainvoke = AsyncMock(return_value=ai_output)
+    vision_llm.with_structured_output = MagicMock(return_value=vision_single_shot_chain)
 
     # Structuring LLM — returns ai_output.
     chain = MagicMock()
@@ -766,6 +793,7 @@ async def test_post_image_assessment_happy_path(async_client: AsyncClient):
             data={
                 "scorecard": _json.dumps(SCORECARD_PAYLOAD),
                 "use_knowledge_base": "false",
+                "assessmentType": "reasoning",
             },
             headers=HEADERS,
         )
@@ -798,6 +826,7 @@ async def test_post_image_assessment_with_knowledge_base(async_client: AsyncClie
             data={
                 "scorecard": _json.dumps(SCORECARD_PAYLOAD),
                 "use_knowledge_base": "true",
+                "assessmentType": "reasoning",
             },
             headers=HEADERS,
         )
@@ -986,6 +1015,7 @@ async def test_image_pipeline_traces_exclude_image_bytes(async_client: AsyncClie
             data={
                 "scorecard": _json.dumps(SCORECARD_PAYLOAD),
                 "use_knowledge_base": "true",
+                "assessmentType": "reasoning",
             },
             headers=HEADERS,
         )

@@ -32,6 +32,11 @@ class ContentType(str, Enum):
     other = "other"
 
 
+class AssessmentType(str, Enum):
+    standard = "standard"
+    reasoning = "reasoning"
+
+
 # --- Input schemas ---
 
 
@@ -41,6 +46,7 @@ class AssessmentRequest(CamelModel):
     content_type: ContentType = ContentType.other
     use_knowledge_base: bool = False
     provider: AIProvider = AIProvider.deepseek
+    assessment_type: AssessmentType = AssessmentType.standard
 
     @field_validator("content", mode="before")
     @classmethod

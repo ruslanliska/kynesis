@@ -648,11 +648,15 @@ def _compose_result(
     request: AssessmentRequest,
     ai_output: "AIScoreOutput",
     reasoning: AggregatedReasoning | None,
+    mark_reasoning_unavailable: bool = False,
 ) -> AssessmentResult:
     """Shared result assembly — merges AIScoreOutput + calculate_scores + rationale.
 
-    `reasoning` may be None when called from the fallback path; in that case every
-    QuestionResult.rationale defaults to "".
+    `reasoning` may be None when called from the fallback path or from a
+    deliberately-chosen single-shot path; in that case every
+    QuestionResult.rationale defaults to "". `mark_reasoning_unavailable`
+    controls the OverallResult flag — set True only when the reasoning pipeline
+    was requested and unavailable.
     """
     section_results, overall_score, total_earned, hard_critical_failure = calculate_scores(
         ai_output.questions, request.scorecard
@@ -705,7 +709,7 @@ def _compose_result(
             passed=passed,
             hard_critical_failure=hard_critical_failure,
             summary=ai_output.summary,
-            reasoning_unavailable=(reasoning is None),
+            reasoning_unavailable=mark_reasoning_unavailable,
         ),
         sections=section_results,
         questions=question_results,
@@ -928,6 +932,81 @@ async def run_image_assessment(
             # --- Structuring stage (reused unchanged) ---
             ai_output = await structuring_stage(request, reasoning, knowledge_base_context)
             return _compose_result(request, ai_output, reasoning)
+
+        try:
+            result = await asyncio.wait_for(_inner(), timeout=timeout_seconds)
+            try:
+                span.set_attribute("outcome", "ok")
+            except Exception:  # pragma: no cover
+                pass
+            return result
+        except asyncio.TimeoutError as e:
+            raise PipelineTimeoutError(timeout_seconds) from e
+
+
+@traceable(name="image_assessment_legacy", run_type="chain")
+async def run_legacy_image_assessment(
+    scorecard: ScorecardDefinition,
+    image_bytes: bytes,
+    filename: str,
+    mime: str,
+    use_knowledge_base: bool = False,
+) -> AssessmentResult:
+    """Single-shot vision orchestrator — counterpart of ``run_legacy_assessment``
+    for the image endpoint. Skips the reasoning/structuring split and calls the
+    vision LLM once with structured output.
+    """
+    from app.assessment.image import image_describe_for_kb, vision_single_shot_assessment
+
+    settings = get_settings()
+    timeout_seconds = settings.assessment.request_timeout_seconds
+
+    with logfire.span(
+        "image_assessment",
+        scorecard_id=scorecard.id,
+        filename=filename,
+        mime=mime,
+        size_bytes=len(image_bytes),
+        use_knowledge_base=use_knowledge_base,
+        assessment_type="standard",
+    ) as span:
+
+        async def _inner() -> AssessmentResult:
+            knowledge_base_context: str | None = None
+            kb_hit = False
+            if use_knowledge_base:
+                try:
+                    description = await image_describe_for_kb(image_bytes, filename, mime)
+                    from app.knowledge_base.services import get_rag_context
+
+                    knowledge_base_context = await get_rag_context(scorecard.id, description)
+                    kb_hit = bool(knowledge_base_context)
+                except Exception as e:  # noqa: BLE001 — KB failure is non-fatal
+                    logfire.warn(
+                        "Knowledge base retrieval failed for image (legacy)", error=str(e)
+                    )
+                    knowledge_base_context = None
+            try:
+                span.set_attribute("knowledge_base_hit", kb_hit)
+            except Exception:  # pragma: no cover
+                pass
+
+            placeholder = _IMAGE_CONTENT_PLACEHOLDER_TEMPLATE.format(
+                filename=filename, size=len(image_bytes)
+            )
+            if len(placeholder) < 50:
+                placeholder = placeholder.ljust(50, ".")
+            request = AssessmentRequest(
+                scorecard=scorecard,
+                content=placeholder,
+                content_type=ContentType.image,
+                use_knowledge_base=use_knowledge_base,
+            )
+
+            ai_output = await vision_single_shot_assessment(
+                scorecard, image_bytes, filename, mime, knowledge_base_context
+            )
+            return _compose_result(request, ai_output, reasoning=None)
 
         try:
             result = await asyncio.wait_for(_inner(), timeout=timeout_seconds)

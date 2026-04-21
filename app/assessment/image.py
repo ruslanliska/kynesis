@@ -82,6 +82,40 @@ Do not merge questions. Do not add commentary outside the `### Q:` blocks.
 """
 
 
+_VISION_SINGLE_SHOT_PROMPT = """\
+You are a rigorous QA auditor performing an evidence-based assessment of a VISUAL artifact.
+
+## CHAIN-OF-THOUGHT PROCESS
+
+1. **content_analysis** — Summarise the image: type of artifact, visible
+   participants/entities, overall layout and context.
+
+2. For EACH question:
+   a. **evidence** — Extract ALL relevant visible evidence. Quote text verbatim
+      when text is visible in the image. Describe visual elements precisely
+      (layout, tone cues, branding, completeness, legibility) otherwise.
+   b. **reasoning** — Analyse what the evidence proves and what is missing.
+      Write this BEFORE selecting an answer.
+   c. **selected_option_id / numeric_value** — Select only after reasoning is
+      complete.
+   d. **comment** — Every claim must trace back to evidence.
+   e. **suggestions** — Null only if full points achieved.
+
+3. **summary** — Synthesise patterns across all questions.
+
+## ANSWER SELECTION
+- Binary / Scale: set selected_option_id to EXACTLY one of the listed option IDs.
+- Numeric: set numeric_value between 0 and maxPoints. Leave selected_option_id null.
+- Tag-only: set selected_option_id for categorisation only.
+
+## CRITICAL RULES
+- Never claim something appears in the image without concrete visual evidence.
+- Quote text verbatim when text is visible; describe visual elements otherwise.
+- Score conservatively when evidence is absent, ambiguous, or illegible.
+- HARD CRITICAL questions auto-fail the entire assessment if scored 0.
+"""
+
+
 _KB_DESCRIBE_PROMPT = """\
 Describe this image in one concise paragraph (3–5 sentences) capturing the
 type of content, visible participants/entities, any visible text (quoted
@@ -141,7 +175,7 @@ async def vision_reasoning_stage(
         size_bytes=len(image_bytes),
         mime=mime,
     ):
-        response = await llm.ainvoke(messages)
+        response = await llm.ainvoke(messages, config={"callbacks": []})
 
     text = response.content if isinstance(response.content, str) else str(response.content)
     records = parse_reasoning_response(text, scorecard)
@@ -161,6 +195,86 @@ async def vision_reasoning_stage(
         records=records,
         full_trace_available=False,
     )
+
+
+@traceable(name="vision_single_shot_assessment", run_type="chain")
+async def vision_single_shot_assessment(
+    scorecard: ScorecardDefinition,
+    image_bytes: bytes,
+    filename: str,
+    mime: str,
+    knowledge_base_context: str | None = None,
+):
+    """Single-shot vision assessment: one LLM call returns the full structured
+    output directly, bypassing the reasoning stage. Mirrors
+    ``run_legacy_assessment`` for text.
+    """
+    from app.assessment.services import (  # local import to avoid cycle
+        AIScoreOutput,
+        MAX_RETRIES,
+        _build_scorecard_context,
+        _validate_output,
+    )
+
+    b64 = base64.b64encode(image_bytes).decode()
+    scorecard_context = _build_scorecard_context(scorecard, knowledge_base_context)
+    system_prompt = _VISION_SINGLE_SHOT_PROMPT + "\n\n" + scorecard_context
+
+    messages: list = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": "Evaluate the following IMAGE against every scorecard question.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                },
+            ]
+        ),
+    ]
+
+    llm = get_vision_reasoning_llm()
+    chain = llm.with_structured_output(AIScoreOutput)
+
+    with logfire.span(
+        "vision_single_shot_assessment",
+        scorecard_id=scorecard.id,
+        filename=filename,
+        size_bytes=len(image_bytes),
+        mime=mime,
+    ):
+        ai_output = None
+        last_error: Exception | None = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                ai_output = await chain.ainvoke(messages, config={"callbacks": []})
+                _validate_output(ai_output, scorecard)
+                break
+            except Exception as e:  # noqa: BLE001 — retried with feedback
+                last_error = e
+                logfire.warn(
+                    "Vision single-shot attempt failed",
+                    attempt=attempt + 1,
+                    error=str(e),
+                )
+                if attempt < MAX_RETRIES - 1:
+                    messages.append(
+                        HumanMessage(
+                            content=(
+                                f"Validation error: {e}\n"
+                                "Please fix and respond again with the complete corrected output."
+                            )
+                        )
+                    )
+
+        if ai_output is None:
+            raise last_error or RuntimeError("Vision single-shot assessment failed after retries.")
+
+    return ai_output
 
 
 @traceable(name="image_describe_for_kb", run_type="chain")

@@ -9,11 +9,13 @@ from openai import APIConnectionError, RateLimitError
 from app.assessment.schemas import (
     AssessmentRequest,
     AssessmentResult,
+    AssessmentType,
     ContentType,
 )
 from app.assessment.services import (
     run_image_assessment,
     run_legacy_assessment,
+    run_legacy_image_assessment,
     run_reasoning_assessment,
 )
 from app.assessment.image import MAX_IMAGE_SIZE, SUPPORTED_IMAGE_EXTENSIONS, resolve_mime
@@ -60,8 +62,14 @@ async def _run_with_error_handling(
             request.content[:1000],
         )
 
+    orchestrator = (
+        run_reasoning_assessment
+        if request.assessment_type == AssessmentType.reasoning
+        else run_legacy_assessment
+    )
+
     try:
-        return await run_reasoning_assessment(request, knowledge_base_context)
+        return await orchestrator(request, knowledge_base_context)
     except (PipelineTimeoutError, ReasoningPayloadTooLargeError, ReasoningUnavailableError):
         # These are already HTTPExceptions with the right status + detail — re-raise.
         raise
@@ -109,6 +117,7 @@ async def create_document_assessment(
     file: UploadFile,
     scorecard: str = Form(...),
     use_knowledge_base: bool = Form(False),
+    assessment_type: AssessmentType = Form(AssessmentType.standard, alias="assessmentType"),
 ) -> AssessmentResult:
     if not file.filename:
         raise ValidationError("File must have a filename.")
@@ -149,6 +158,7 @@ async def create_document_assessment(
         content=text,
         content_type=ContentType.document,
         use_knowledge_base=use_knowledge_base,
+        assessment_type=assessment_type,
     )
 
     return await _run_with_error_handling(request)
@@ -159,6 +169,7 @@ async def create_audio_assessment(
     file: UploadFile,
     scorecard: str = Form(...),
     use_knowledge_base: bool = Form(False),
+    assessment_type: AssessmentType = Form(AssessmentType.standard, alias="assessmentType"),
 ) -> AssessmentResult:
     # Validate file
     if not file.filename:
@@ -198,6 +209,7 @@ async def create_audio_assessment(
         content=transcript,
         content_type=ContentType.audio_conversation,
         use_knowledge_base=use_knowledge_base,
+        assessment_type=assessment_type,
     )
 
     return await _run_with_error_handling(request)
@@ -209,6 +221,7 @@ async def create_image_assessment(
     file: UploadFile,
     scorecard: str = Form(...),
     use_knowledge_base: bool = Form(False),
+    assessment_type: AssessmentType = Form(AssessmentType.standard, alias="assessmentType"),
 ) -> AssessmentResult:
     """Feature 004 — vision-based image assessment.
 
@@ -257,8 +270,14 @@ async def create_image_assessment(
     mime = resolve_mime(file.filename)
 
     # --- Run vision-based assessment ---
+    orchestrator = (
+        run_image_assessment
+        if assessment_type == AssessmentType.reasoning
+        else run_legacy_image_assessment
+    )
+
     try:
-        return await run_image_assessment(
+        return await orchestrator(
             scorecard=scorecard_obj,
             image_bytes=content,
             filename=file.filename,
