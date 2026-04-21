@@ -2,19 +2,18 @@ import base64
 
 import logfire
 
+from app.assessment.image import MIME_TYPES as _MIME_TYPES, SUPPORTED_IMAGE_EXTENSIONS
 from app.core.ai_provider import get_openai_client
 
-SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+__all__ = [
+    "SUPPORTED_IMAGE_EXTENSIONS",
+    "MAX_PDF_OCR_PAGES",
+    "ocr_image",
+    "ocr_pdf",
+    "is_sparse_pdf",
+]
 
 MAX_PDF_OCR_PAGES = 30
-
-_MIME_TYPES: dict[str, str] = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
 
 _OCR_PROMPT = (
     "Extract all text from this image exactly as it appears. "

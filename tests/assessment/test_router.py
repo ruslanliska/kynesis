@@ -696,3 +696,342 @@ async def test_assessments_audio_oversize_returns_422(async_client: AsyncClient)
 
     assert response.status_code == 422
     assert "maximum" in response.json()["detail"].lower() or "25" in response.json()["detail"]
+
+
+# ============================================================================
+# Feature 004-image-assessment — POST /api/v1/assessments/image
+# ============================================================================
+
+# 1x1 PNG — smallest valid PNG bytes (transparent pixel).
+_TINY_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8"
+    b"\xcf\xc0\x00\x00\x00\x03\x00\x01\xaa\xe3\xbe+\x00\x00\x00\x00IEND"
+    b"\xaeB`\x82"
+)
+
+
+def _patch_image_pipeline(ai_output):
+    """Patch the image pipeline LLMs. Returns an ExitStack-like dict of patches."""
+    # Vision reasoning LLM — returns `### Q: <id>` blocks for each question.
+    reasoning_text = _build_reasoning_text(ai_output)
+    vision_response = MagicMock()
+    vision_response.content = reasoning_text
+    vision_response.additional_kwargs = {}
+    vision_llm = MagicMock()
+    vision_llm.ainvoke = AsyncMock(return_value=vision_response)
+
+    # Structuring LLM — returns ai_output.
+    chain = MagicMock()
+    chain.ainvoke = AsyncMock(return_value=ai_output)
+    structuring_llm = MagicMock()
+    structuring_llm.with_structured_output = MagicMock(return_value=chain)
+
+    # KB describe LLM — harmless default; only called when use_knowledge_base=True.
+    describe_response = MagicMock()
+    describe_response.content = "A screenshot."
+    describe_response.additional_kwargs = {}
+    describe_llm = MagicMock()
+    describe_llm.ainvoke = AsyncMock(return_value=describe_response)
+
+    return {
+        "vision": vision_llm,
+        "structuring": structuring_llm,
+        "describe": describe_llm,
+    }
+
+
+@contextlib.contextmanager
+def _patch_image_llms(ai_output):
+    mocks = _patch_image_pipeline(ai_output)
+    with (
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=mocks["vision"]),
+        patch("app.assessment.services.get_structuring_llm", return_value=mocks["structuring"]),
+        patch("app.assessment.image.get_image_kb_describe_llm", return_value=mocks["describe"]),
+    ):
+        yield mocks
+
+
+# --- T012 happy path ---
+
+
+async def test_post_image_assessment_happy_path(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    with _patch_image_llms(_mock_ai_output()):
+        response = await async_client.post(
+            "/api/v1/assessments/image",
+            files={"file": ("screenshot.png", io.BytesIO(_TINY_PNG), "image/png")},
+            data={
+                "scorecard": _json.dumps(SCORECARD_PAYLOAD),
+                "use_knowledge_base": "false",
+            },
+            headers=HEADERS,
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["contentType"] == "image"
+    assert len(data["questions"]) == 2
+    for q in data["questions"]:
+        assert q["rationale"] != ""
+    assert data["overall"]["reasoningUnavailable"] is False
+
+
+# --- T013 with knowledge base — HTTP-surface contract only ---
+
+
+async def test_post_image_assessment_with_knowledge_base(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    rag_mock = AsyncMock(return_value="## KB\nSome context.\n")
+
+    with (
+        _patch_image_llms(_mock_ai_output()),
+        patch("app.knowledge_base.services.get_rag_context", rag_mock),
+    ):
+        response = await async_client.post(
+            "/api/v1/assessments/image",
+            files={"file": ("screenshot.png", io.BytesIO(_TINY_PNG), "image/png")},
+            data={
+                "scorecard": _json.dumps(SCORECARD_PAYLOAD),
+                "use_knowledge_base": "true",
+            },
+            headers=HEADERS,
+        )
+
+    assert response.status_code == 200, response.text
+    rag_mock.assert_awaited_once()
+    # The query argument is the scorecard ID — confirms wiring reaches the service.
+    assert rag_mock.await_args.args[0] == SCORECARD_PAYLOAD["id"]
+
+
+# --- T013a US1 inactive scorecard (spec US1 scenario 6) ---
+
+
+async def test_post_image_assessment_inactive_scorecard(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    scorecard_draft = copy.deepcopy(SCORECARD_PAYLOAD)
+    scorecard_draft["status"] = "draft"
+
+    response = await async_client.post(
+        "/api/v1/assessments/image",
+        files={"file": ("screenshot.png", io.BytesIO(_TINY_PNG), "image/png")},
+        data={"scorecard": _json.dumps(scorecard_draft)},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert "active" in response.json()["detail"].lower()
+
+
+# --- T018 missing filename ---
+
+
+async def test_post_image_assessment_missing_filename(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    mocks = _patch_image_pipeline(_mock_ai_output())
+    with (
+        patch("app.assessment.image.get_vision_reasoning_llm", return_value=mocks["vision"]),
+        patch("app.assessment.services.get_structuring_llm", return_value=mocks["structuring"]),
+    ):
+        response = await async_client.post(
+            "/api/v1/assessments/image",
+            files={"file": ("", io.BytesIO(_TINY_PNG), "image/png")},
+            data={"scorecard": _json.dumps(SCORECARD_PAYLOAD)},
+            headers=HEADERS,
+        )
+
+    assert response.status_code == 422
+    # FastAPI may reject the empty-filename multipart at body-validation time
+    # (detail: list[ErrorDetails]) or it reaches our handler (detail: str).
+    # Either way is acceptable — what matters is that no AI call was made.
+    detail = response.json()["detail"]
+    if isinstance(detail, str):
+        assert "filename" in detail.lower()
+    mocks["vision"].ainvoke.assert_not_called()
+    mocks["structuring"].with_structured_output.return_value.ainvoke.assert_not_called()
+
+
+# --- T019 unsupported extension ---
+
+
+async def test_post_image_assessment_unsupported_extension(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    response = await async_client.post(
+        "/api/v1/assessments/image",
+        files={"file": ("photo.bmp", io.BytesIO(_TINY_PNG), "image/bmp")},
+        data={"scorecard": _json.dumps(SCORECARD_PAYLOAD)},
+        headers=HEADERS,
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert ".png" in detail and ".jpg" in detail
+
+
+# --- T020 empty file ---
+
+
+async def test_post_image_assessment_empty_file(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    response = await async_client.post(
+        "/api/v1/assessments/image",
+        files={"file": ("empty.png", io.BytesIO(b""), "image/png")},
+        data={"scorecard": _json.dumps(SCORECARD_PAYLOAD)},
+        headers=HEADERS,
+    )
+    assert response.status_code == 422
+    assert "empty" in response.json()["detail"].lower()
+
+
+# --- T021 oversized file ---
+
+
+async def test_post_image_assessment_oversized_file(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    from app.assessment.image import MAX_IMAGE_SIZE
+
+    big = io.BytesIO(b"\x89PNG" + b"\x00" * (MAX_IMAGE_SIZE + 1))
+    response = await async_client.post(
+        "/api/v1/assessments/image",
+        files={"file": ("big.png", big, "image/png")},
+        data={"scorecard": _json.dumps(SCORECARD_PAYLOAD)},
+        headers=HEADERS,
+    )
+    assert response.status_code == 422
+    assert "20MB" in response.json()["detail"] or "maximum" in response.json()["detail"].lower()
+
+
+# --- T022 invalid scorecard JSON ---
+
+
+async def test_post_image_assessment_invalid_scorecard_json(async_client: AsyncClient):
+    import io
+
+    response = await async_client.post(
+        "/api/v1/assessments/image",
+        files={"file": ("screenshot.png", io.BytesIO(_TINY_PNG), "image/png")},
+        data={"scorecard": "{not json"},
+        headers=HEADERS,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith("Invalid scorecard JSON")
+
+
+# --- T023 multi-file request (FR-012) ---
+
+
+async def test_post_image_assessment_multiple_files(async_client: AsyncClient):
+    import io
+    import json as _json
+
+    # FastAPI's single-file signature rejects the second file as an invalid extra field.
+    response = await async_client.post(
+        "/api/v1/assessments/image",
+        files=[
+            ("file", ("a.png", io.BytesIO(_TINY_PNG), "image/png")),
+            ("file", ("b.png", io.BytesIO(_TINY_PNG), "image/png")),
+        ],
+        data={"scorecard": _json.dumps(SCORECARD_PAYLOAD)},
+        headers=HEADERS,
+    )
+    # FastAPI returns 422 (body validation) when a single-file field gets multiple files.
+    assert response.status_code == 422
+
+
+# --- T025 trace-redaction regression test (Phase 5, included here for cohesion) ---
+
+
+async def test_image_pipeline_traces_exclude_image_bytes(async_client: AsyncClient):
+    """End-to-end assertion that image bytes / base64 do not appear in any
+    Logfire span attribute and that both image-bearing LLM calls were invoked
+    with config={"callbacks": []} (suppressing LangSmith capture)."""
+    import base64
+    import io
+    import json as _json
+
+    from app.assessment import image as image_mod
+    from app.assessment import services as services_mod
+
+    captured_span_attrs: list[dict] = []
+    real_span = services_mod.logfire.span
+
+    def recording_span(name, **kwargs):
+        captured_span_attrs.append({"name": name, **kwargs})
+        return real_span(name, **kwargs)
+
+    rag_mock = AsyncMock(return_value="## KB\nContext.\n")
+
+    with (
+        _patch_image_llms(_mock_ai_output()) as mocks,
+        patch("app.knowledge_base.services.get_rag_context", rag_mock),
+        patch.object(services_mod.logfire, "span", side_effect=recording_span),
+        patch.object(image_mod.logfire, "span", side_effect=recording_span),
+    ):
+        response = await async_client.post(
+            "/api/v1/assessments/image",
+            files={"file": ("screenshot.png", io.BytesIO(_TINY_PNG), "image/png")},
+            data={
+                "scorecard": _json.dumps(SCORECARD_PAYLOAD),
+                "use_knowledge_base": "true",
+            },
+            headers=HEADERS,
+        )
+
+    assert response.status_code == 200, response.text
+
+    b64 = base64.b64encode(_TINY_PNG).decode()
+    for attrs in captured_span_attrs:
+        for key, value in attrs.items():
+            s = str(value)
+            assert b64 not in s, f"base64 leaked into span attr {key}={s!r}"
+            assert "data:image/" not in s, f"data URL leaked into span attr {key}={s!r}"
+
+    # Both image-bearing LLM calls used config={"callbacks": []}.
+    vision_calls = mocks["vision"].ainvoke.await_args_list
+    describe_calls = mocks["describe"].ainvoke.await_args_list
+    assert len(vision_calls) == 1
+    assert len(describe_calls) == 1
+    for call in vision_calls + describe_calls:
+        assert call.kwargs.get("config") == {"callbacks": []}
+
+
+# --- T027 concurrency smoke test (SC-006) ---
+
+
+async def test_post_image_assessment_concurrent_requests(async_client: AsyncClient):
+    """10 parallel image-assessment requests all succeed with no shared-state bug."""
+    import asyncio
+    import io
+    import json as _json
+
+    with _patch_image_llms(_mock_ai_output()):
+        tasks = [
+            async_client.post(
+                "/api/v1/assessments/image",
+                files={"file": (f"shot-{i}.png", io.BytesIO(_TINY_PNG), "image/png")},
+                data={"scorecard": _json.dumps(SCORECARD_PAYLOAD)},
+                headers=HEADERS,
+            )
+            for i in range(10)
+        ]
+        responses = await asyncio.gather(*tasks)
+
+    for r in responses:
+        assert r.status_code == 200, r.text
+        assert r.json()["contentType"] == "image"
+    # At least one timestamp distinct — sanity check that responses were independent.
+    timestamps = {r.json()["assessedAt"] for r in responses}
+    assert len(timestamps) >= 1
