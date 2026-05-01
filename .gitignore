@@ -32,5 +32,3 @@ htmlcov/
 # Logfire
 .logfire/
 
-# uv
-uv.lock
