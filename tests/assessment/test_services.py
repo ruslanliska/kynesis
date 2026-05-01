@@ -71,6 +71,7 @@ def _scorecard(
     sections: list[tuple[str, float | None, list[ScorecardQuestion]]],
     max_score: int = 100,
     mode: ScoringMode = ScoringMode.add,
+    passing_threshold: float | None = None,
 ) -> ScorecardDefinition:
     return ScorecardDefinition(
         id="sc-1",
@@ -78,6 +79,7 @@ def _scorecard(
         status=ScorecardStatus.active,
         scoring_mode=mode,
         max_score=max_score,
+        passing_threshold=passing_threshold,
         sections=[
             ScorecardSection(
                 id=sid,
@@ -208,6 +210,134 @@ def test_soft_critical_does_not_trigger_hard_failure():
     ai = [_ai_q("q1", "q1-no")]
     _, _, _, hcf = calculate_scores(ai, sc)
     assert hcf is False
+
+
+# --- Banking Support QA scorecard shape (4 sections, weights 25/25/25/25,
+# questions 10/5/5/5, max_score=25, threshold=20). Mirrors a real customer
+# scorecard reported on 2026-05-01. ---
+
+
+def _banking_support_scorecard(passing_threshold: float | None = 20) -> ScorecardDefinition:
+    return _scorecard(
+        [
+            ("s1", 25.0, [_binary_question("q1", 10, critical=CriticalType.hard)]),
+            ("s2", 25.0, [_binary_question("q2", 5)]),
+            ("s3", 25.0, [_binary_question("q3", 5)]),
+            ("s4", 25.0, [_binary_question("q4", 5)]),
+        ],
+        max_score=25,
+        passing_threshold=passing_threshold,
+    )
+
+
+def test_banking_support_perfect_run_overall_100():
+    sc = _banking_support_scorecard()
+    ai = [
+        _ai_q("q1", "q1-yes"),
+        _ai_q("q2", "q2-yes"),
+        _ai_q("q3", "q3-yes"),
+        _ai_q("q4", "q4-yes"),
+    ]
+    sections, overall, total_earned, hcf = calculate_scores(ai, sc)
+    assert overall == 100.0
+    assert total_earned == 25.0
+    assert hcf is False
+    assert all(s.score == 100.0 for s in sections)
+
+
+def test_banking_support_partial_run_overall_is_weighted_percentage():
+    # Only Identity Verification (q1=10) earned; others zero → 10/25 = 40%.
+    sc = _banking_support_scorecard()
+    ai = [
+        _ai_q("q1", "q1-yes"),
+        _ai_q("q2", "q2-no"),
+        _ai_q("q3", "q3-no"),
+        _ai_q("q4", "q4-no"),
+    ]
+    sections, overall, total_earned, hcf = calculate_scores(ai, sc)
+    assert overall == 40.0
+    assert total_earned == 10.0
+    assert hcf is False
+    assert sections[0].score == 100.0
+    assert sections[1].score == 0.0
+    assert sections[2].score == 0.0
+    assert sections[3].score == 0.0
+
+
+async def test_banking_support_perfect_run_passes_threshold():
+    # threshold=20 on max_score=25 → 80%. Perfect run = 100% → passed=True.
+    sc = _banking_support_scorecard(passing_threshold=20)
+    req = _make_request(sc)
+    ai_output = AIScoreOutput(
+        content_analysis="x",
+        questions=[
+            AIQuestionOutput(
+                question_id=qid,
+                selected_option_id=f"{qid}-yes",
+                evidence=["e"],
+                reasoning="r",
+                comment="c",
+            )
+            for qid in ("q1", "q2", "q3", "q4")
+        ],
+        summary="All sections achieved full marks.",
+    )
+
+    reasoning_llm = _mock_reasoning_llm(_reasoning_text(["q1", "q2", "q3", "q4"]))
+    structuring_llm = _mock_structuring_llm(ai_output)
+
+    with (
+        patch("app.assessment.services.get_reasoning_llm", return_value=reasoning_llm),
+        patch("app.assessment.services.get_structuring_llm", return_value=structuring_llm),
+    ):
+        result = await run_reasoning_assessment(req)
+
+    assert result.overall.score == 100.0
+    assert result.overall.passed is True
+    assert result.overall.hard_critical_failure is False
+    assert all(s.score == 100.0 for s in result.sections)
+
+
+async def test_banking_support_below_threshold_fails():
+    # Only q1 (10 of 25) earned → 40% < 80% threshold → passed=False.
+    sc = _banking_support_scorecard(passing_threshold=20)
+    req = _make_request(sc)
+    ai_output = AIScoreOutput(
+        content_analysis="x",
+        questions=[
+            AIQuestionOutput(
+                question_id="q1",
+                selected_option_id="q1-yes",
+                evidence=["e"],
+                reasoning="r",
+                comment="c",
+            ),
+            *[
+                AIQuestionOutput(
+                    question_id=qid,
+                    selected_option_id=f"{qid}-no",
+                    evidence=["e"],
+                    reasoning="r",
+                    comment="c",
+                )
+                for qid in ("q2", "q3", "q4")
+            ],
+        ],
+        summary="Most sections failed.",
+    )
+
+    reasoning_llm = _mock_reasoning_llm(_reasoning_text(["q1", "q2", "q3", "q4"]))
+    structuring_llm = _mock_structuring_llm(ai_output)
+
+    with (
+        patch("app.assessment.services.get_reasoning_llm", return_value=reasoning_llm),
+        patch("app.assessment.services.get_structuring_llm", return_value=structuring_llm),
+    ):
+        result = await run_reasoning_assessment(req)
+
+    assert result.overall.score == 40.0
+    assert result.overall.passed is False
+    assert result.overall.hard_critical_failure is False
 
 
 # ============================================================================

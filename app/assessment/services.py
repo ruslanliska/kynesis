@@ -248,10 +248,16 @@ def calculate_scores(
     ai_questions: list[AIQuestionOutput],
     scorecard: ScorecardDefinition,
 ) -> tuple[list[SectionResult], float, float, bool]:
-    """Return (section_results, overall_score_pct, total_earned_points, hard_critical_failure)."""
+    """Return (section_results, overall_score_pct, total_earned_points, hard_critical_failure).
+
+    `overall_score_pct` is a true 0-100 percentage of question points earned, independent
+    of the user-configured `scorecard.max_score` scale. This keeps the result correct even
+    if a scorecard is ever submitted with `max_score != Σ question.max_points`.
+    """
     ai_map = {q.question_id: q for q in ai_questions}
     section_results: list[SectionResult] = []
     total_earned = 0.0
+    total_max_points = 0
     hard_critical_failure = False
 
     for section in scorecard.sections:
@@ -266,6 +272,7 @@ def calculate_scores(
                 hard_critical_failure = True
 
         total_earned += section_earned
+        total_max_points += section_max
         raw = (section_earned / section_max * 100) if section_max > 0 else 100.0
         section_results.append(
             SectionResult(
@@ -276,7 +283,7 @@ def calculate_scores(
             )
         )
 
-    overall = (total_earned / scorecard.max_score * 100) if scorecard.max_score > 0 else 0.0
+    overall = (total_earned / total_max_points * 100) if total_max_points > 0 else 0.0
     return section_results, round(max(0.0, min(overall, 100.0)), 1), round(total_earned, 1), hard_critical_failure
 
 
@@ -325,7 +332,7 @@ async def run_legacy_assessment(
         if ai_output is None:
             raise last_error or RuntimeError("Assessment failed after retries.")
 
-    section_results, overall_score, total_earned, hard_critical_failure = calculate_scores(
+    section_results, overall_score, _, hard_critical_failure = calculate_scores(
         ai_output.questions, request.scorecard
     )
 
@@ -333,8 +340,13 @@ async def run_legacy_assessment(
         overall_score = 0.0
 
     if request.scorecard.passing_threshold is not None:
+        threshold_pct = (
+            request.scorecard.passing_threshold / request.scorecard.max_score * 100
+            if request.scorecard.max_score > 0
+            else 0.0
+        )
         passed: bool | None = (
-            not hard_critical_failure and total_earned >= request.scorecard.passing_threshold
+            not hard_critical_failure and overall_score >= threshold_pct
         )
     else:
         passed = None if not hard_critical_failure else False
@@ -658,7 +670,7 @@ def _compose_result(
     controls the OverallResult flag — set True only when the reasoning pipeline
     was requested and unavailable.
     """
-    section_results, overall_score, total_earned, hard_critical_failure = calculate_scores(
+    section_results, overall_score, _, hard_critical_failure = calculate_scores(
         ai_output.questions, request.scorecard
     )
 
@@ -666,9 +678,13 @@ def _compose_result(
         overall_score = 0.0
 
     if request.scorecard.passing_threshold is not None:
+        threshold_pct = (
+            request.scorecard.passing_threshold / request.scorecard.max_score * 100
+            if request.scorecard.max_score > 0
+            else 0.0
+        )
         passed: bool | None = (
-            not hard_critical_failure
-            and total_earned >= request.scorecard.passing_threshold
+            not hard_critical_failure and overall_score >= threshold_pct
         )
     else:
         passed = None if not hard_critical_failure else False
