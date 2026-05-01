@@ -1,0 +1,36 @@
+# VCS
+.git
+.gitignore
+.github
+
+# Python / virtualenv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# IDE / editors
+.idea
+.vscode
+
+# Local env files (keep .env.example for reference)
+.env
+.env.dev
+.env.staging
+.env.production
+
+# Project-local artifacts not needed at runtime
+artifacts
+tests
+specs
+docs
+.specify
+.claude
+
+# OS junk
+.DS_Store
+Thumbs.db
